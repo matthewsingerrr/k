@@ -14,11 +14,18 @@ import {
   handleChatInput,
   hasNestedQuantifier,
   parseScope,
+  prepareAdd,
   regexIsFast,
+  renderHistory,
+  renderPages,
+  renderSiteInfo,
+  renderSubdomains,
   REPLY_DEADLINE_MS,
   resolvePageUrl,
+  validatePattern,
   type CommandDeps,
 } from '../src/discord/commands.js';
+import type { PanelHost } from '../src/discord/panel.js';
 import { testConfig, type Config } from '../src/config.js';
 import { Store } from '../src/db/store.js';
 import type { BaselineSummary, Monitor, TickSummary, WatchRuntimeInfo } from '../src/monitor/scheduler.js';
@@ -119,6 +126,7 @@ function fakeMonitor(store: Store, timeline: string[]) {
 
 interface ChatOpts {
   sub: string;
+  command?: string;
   options?: Record<string, unknown>;
   guildId?: string | null;
   channelId?: string;
@@ -131,6 +139,7 @@ function fakeChat(o: ChatOpts, timeline: string[] = []) {
   const opts = o.options ?? {};
   const get = (name: string) => (opts[name] === undefined ? null : opts[name]);
   const i = {
+    commandName: o.command ?? 'watch',
     guildId: o.guildId === undefined ? GUILD : o.guildId,
     channelId: o.channelId ?? CHANNEL,
     user: { id: USER },
@@ -300,6 +309,7 @@ function makeWatch(url = 'https://unpeg.io/', over: Partial<Parameters<Store['cr
     host: u.hostname,
     rootDomain: 'unpeg.io',
     createdBy: USER,
+    intervalSec: 30,
     ...over,
   });
   return store.updateWatch(w.id, { baselineDone: true });
@@ -327,74 +337,70 @@ beforeEach(() => {
 describe('commandDefinitions', () => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const defs = commandDefinitions({ minIntervalSec: 10 }) as any[];
-  const cmd = defs[0];
+  const cmd = defs.find((d) => d.name === 'watch');
+  const panel = defs.find((d) => d.name === 'panel');
   const subs = new Map<string, any>(cmd.options.map((o: any) => [o.name, o])); // eslint-disable-line @typescript-eslint/no-explicit-any
 
-  it('is one guild-only /watch command gated by Manage Server', () => {
-    expect(defs).toHaveLength(1);
+  it('is /watch plus /panel, both guild-only and gated by Manage Server', () => {
+    expect(defs.map((d) => d.name).sort()).toEqual(['panel', 'watch']);
     expect(JSON.parse(JSON.stringify(defs))).toEqual(defs);
-    expect(cmd.name).toBe('watch');
-    expect(cmd.default_member_permissions).toBe(String(PermissionFlagsBits.ManageGuild));
-    expect(cmd.dm_permission).toBe(false);
-    expect(cmd.contexts).toEqual([0]);
+    for (const d of defs) {
+      expect(d.default_member_permissions).toBe(String(PermissionFlagsBits.ManageGuild));
+      expect(d.dm_permission).toBe(false);
+      expect(d.contexts).toEqual([0]);
+    }
+    expect(panel.description).toBe('Post the Site Watcher dashboard in this channel');
+    expect(panel.options ?? []).toEqual([]);
   });
 
-  it('has every subcommand', () => {
-    expect([...subs.keys()].sort()).toEqual(
-      ['add', 'addpage', 'check', 'exclude', 'help', 'history', 'ignore', 'info', 'list', 'pages', 'pause', 'remove', 'resume', 'set', 'subdomains'].sort(),
-    );
+  it('keeps only the trimmed /watch subcommands', () => {
+    expect([...subs.keys()].sort()).toEqual(['add', 'check', 'help', 'list', 'remove']);
     for (const s of subs.values()) expect(s.type).toBe(ApplicationCommandOptionType.Subcommand);
   });
 
   it('respects Discord naming and size limits', () => {
-    let chars = 0;
-    const visit = (o: any, depth: number) => { // eslint-disable-line @typescript-eslint/no-explicit-any
-      expect(o.name).toMatch(/^[-_\p{Ll}\p{N}]{1,32}$/u);
-      expect(o.description.length).toBeGreaterThan(0);
-      expect(o.description.length).toBeLessThanOrEqual(100);
-      chars += o.name.length + o.description.length;
-      for (const c of o.choices ?? []) chars += c.name.length + String(c.value).length;
-      const opts = o.options ?? [];
-      expect(opts.length).toBeLessThanOrEqual(25);
-      if (depth > 0) {
-        // required options first
-        const firstOptional = opts.findIndex((x: any) => !x.required); // eslint-disable-line @typescript-eslint/no-explicit-any
-        if (firstOptional >= 0) expect(opts.slice(firstOptional).every((x: any) => !x.required)).toBe(true); // eslint-disable-line @typescript-eslint/no-explicit-any
-      }
-      const names = opts.map((x: any) => x.name); // eslint-disable-line @typescript-eslint/no-explicit-any
-      expect(new Set(names).size).toBe(names.length);
-      for (const c of opts) visit(c, depth + 1);
-    };
-    visit(cmd, 0);
-    expect(chars).toBeLessThanOrEqual(8000);
+    for (const def of defs) {
+      let chars = 0;
+      const visit = (o: any, depth: number) => { // eslint-disable-line @typescript-eslint/no-explicit-any
+        expect(o.name).toMatch(/^[-_\p{Ll}\p{N}]{1,32}$/u);
+        expect(o.description.length).toBeGreaterThan(0);
+        expect(o.description.length).toBeLessThanOrEqual(100);
+        chars += o.name.length + o.description.length;
+        const opts = o.options ?? [];
+        expect(opts.length).toBeLessThanOrEqual(25);
+        if (depth > 0) {
+          const firstOptional = opts.findIndex((x: any) => !x.required); // eslint-disable-line @typescript-eslint/no-explicit-any
+          if (firstOptional >= 0) expect(opts.slice(firstOptional).every((x: any) => !x.required)).toBe(true); // eslint-disable-line @typescript-eslint/no-explicit-any
+        }
+        const names = opts.map((x: any) => x.name); // eslint-disable-line @typescript-eslint/no-explicit-any
+        expect(new Set(names).size).toBe(names.length);
+        for (const c of opts) visit(c, depth + 1);
+      };
+      visit(def, 0);
+      expect(chars).toBeLessThanOrEqual(8000);
+    }
   });
 
   it('declares the documented options', () => {
     const opt = (sub: string, name: string) => subs.get(sub).options?.find((o: any) => o.name === name); // eslint-disable-line @typescript-eslint/no-explicit-any
+    expect(subs.get('add').options.map((o: any) => o.name)).toEqual(['url', 'name', 'channel', 'interval', 'ping']); // eslint-disable-line @typescript-eslint/no-explicit-any
     expect(opt('add', 'url')).toMatchObject({ type: ApplicationCommandOptionType.String, required: true });
     expect(opt('add', 'interval')).toMatchObject({ type: ApplicationCommandOptionType.Integer, min_value: 10, max_value: 3600 });
     expect(opt('add', 'channel').channel_types).toEqual([ChannelType.GuildText, ChannelType.GuildAnnouncement]);
     expect(opt('add', 'ping').type).toBe(ApplicationCommandOptionType.Role);
-    expect(opt('add', 'max_pages')).toMatchObject({ min_value: 1, max_value: 1000 });
-    for (const s of ['name', 'crawl', 'scope', 'subdomains']) expect(opt('add', s), s).toBeDefined();
-    expect(opt('add', 'crawl').type).toBe(ApplicationCommandOptionType.Boolean);
-    for (const sub of ['remove', 'info', 'check', 'pause', 'resume', 'set', 'ignore', 'exclude', 'addpage', 'pages', 'subdomains', 'history']) {
+    for (const sub of ['remove', 'check']) {
       expect(opt(sub, 'site')).toMatchObject({ required: true, autocomplete: true, type: ApplicationCommandOptionType.String });
     }
-    expect(opt('set', 'sweep')).toMatchObject({ min_value: 30, max_value: 86_400 });
-    for (const f of ['deploy', 'text', 'pages', 'subdomains', 'files', 'status', 'code_intel', 'ignore_numbers', 'clear_ping']) {
-      expect(opt('set', f)?.type).toBe(ApplicationCommandOptionType.Boolean);
-    }
-    expect(opt('ignore', 'pattern')).toMatchObject({ required: true });
-    expect(opt('addpage', 'url')).toMatchObject({ required: true });
-    expect(opt('history', 'limit')).toMatchObject({ min_value: 1, max_value: 25 });
     expect(opt('check', 'full').type).toBe(ApplicationCommandOptionType.Boolean);
   });
 
-  it('keeps interval bounds valid for odd configs', () => {
-    const d = commandDefinitions({ minIntervalSec: 99_999 })[0] as any; // eslint-disable-line @typescript-eslint/no-explicit-any
-    const interval = d.options.find((o: any) => o.name === 'add').options.find((o: any) => o.name === 'interval'); // eslint-disable-line @typescript-eslint/no-explicit-any
-    expect(interval.min_value).toBeLessThanOrEqual(interval.max_value);
+  it('takes the minimum interval from the config (1–2 s allowed) and keeps bounds valid for odd configs', () => {
+    const interval = (min: number) =>
+      (commandDefinitions({ minIntervalSec: min })[0] as any).options.find((o: any) => o.name === 'add').options.find((o: any) => o.name === 'interval'); // eslint-disable-line @typescript-eslint/no-explicit-any
+    expect(interval(1).min_value).toBe(1);
+    expect(interval(2).min_value).toBe(2);
+    const odd = interval(99_999);
+    expect(odd.min_value).toBeLessThanOrEqual(odd.max_value);
   });
 });
 
@@ -409,26 +415,93 @@ describe('guards', () => {
     expect(isEphemeral(last(f.calls))).toBe(true);
   });
 
-  it('requires Manage Server for mutating subcommands but not for views', async () => {
+  it('requires Manage Server for mutating subcommands and /panel, but not for views', async () => {
     makeWatch();
-    for (const sub of ['add', 'remove', 'set', 'pause', 'resume', 'ignore', 'exclude', 'addpage', 'check']) {
-      const f = await run({ sub, manage: false, options: { site: 'Unpeg', url: 'x.io', pattern: 'x' } });
+    for (const sub of ['add', 'remove', 'check']) {
+      const f = await run({ sub, manage: false, options: { site: 'Unpeg', url: 'x.io' } });
       expect(textOf(last(f.calls))).toContain('Manage Server');
       expect(isEphemeral(last(f.calls))).toBe(true);
     }
+    const p = await run({ sub: '', command: 'panel', manage: false });
+    expect(textOf(last(p.calls))).toContain('Manage Server');
     expect(store.listWatches()).toHaveLength(1);
+    expect(mon.calls.checkNow).toHaveLength(0);
     const f = await run({ sub: 'list', manage: false });
     expect(textOf(last(f.calls))).toContain('Unpeg');
+  });
+
+  it('removed subcommands point to the dashboard', async () => {
+    makeWatch();
+    for (const sub of ['set', 'pause', 'info']) {
+      const f = await run({ sub, options: { site: 'Unpeg' } });
+      expect(textOf(last(f.calls))).toContain('/panel');
+      expect(isEphemeral(last(f.calls))).toBe(true);
+    }
+    expect(store.getWatch(1)!.paused).toBe(false);
   });
 
   it('unknown sites give the documented message', async () => {
     const other = store.createWatch({ guildId: OTHER_GUILD, channelId: 'c', name: 'Else', url: 'https://else.io/', host: 'else.io', rootDomain: 'else.io', createdBy: 'u' });
     for (const site of ['nope', String(other.id), 'else.io']) {
-      const f = await run({ sub: 'info', options: { site } });
+      const f = await run({ sub: 'check', options: { site } });
       expect(last(f.calls).payload.content).toBe('⚠️ Unknown site. Use /watch list.');
       expect(isEphemeral(last(f.calls))).toBe(true);
     }
+    expect(mon.calls.checkNow).toHaveLength(0);
     expect(log.entries.filter((e) => e.level === 'error')).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /panel
+// ---------------------------------------------------------------------------
+
+describe('/panel', () => {
+  function host(impl?: (g: string, c: string) => Promise<string>) {
+    const placed: Array<[string, string]> = [];
+    const h: PanelHost & { placed: typeof placed; refreshed: string[] } = {
+      placed,
+      refreshed: [],
+      async placePanel(g, c) {
+        placed.push([g, c]);
+        return impl ? impl(g, c) : `https://discord.com/channels/${g}/${c}/999`;
+      },
+      refresh(g) {
+        this.refreshed.push(g);
+      },
+    };
+    return h;
+  }
+
+  it('posts the dashboard in this channel and replies ephemerally with its link', async () => {
+    const h = host();
+    deps.panel = h;
+    const f = await run({ sub: '', command: 'panel' });
+    expect(h.placed).toEqual([[GUILD, CHANNEL]]);
+    expect(f.calls[0].type).toBe('defer');
+    expect(isEphemeral(f.calls[0])).toBe(true);
+    expect(textOf(last(f.calls))).toContain(`https://discord.com/channels/${GUILD}/${CHANNEL}/999`);
+  });
+
+  it('explains when the dashboard is unavailable or cannot be posted', async () => {
+    deps.panel = null;
+    let f = await run({ sub: '', command: 'panel' });
+    expect(textOf(last(f.calls))).toContain('not available right now');
+    expect(isEphemeral(last(f.calls))).toBe(true);
+
+    deps.panel = host(async () => {
+      throw Object.assign(new Error('Missing Permissions'), { code: 50013 });
+    });
+    f = await run({ sub: '', command: 'panel' });
+    expect(textOf(last(f.calls))).toContain('Pin Messages');
+    expect(log.entries.filter((e) => e.level === 'error')).toHaveLength(0);
+
+    deps.panel = host(async () => {
+      throw new Error('boom');
+    });
+    f = await run({ sub: '', command: 'panel' });
+    expect(last(f.calls).payload.content).toBe('⚠️ boom');
+    expect(log.entries.some((e) => e.level === 'error' && e.msg.includes('/panel'))).toBe(true);
   });
 });
 
@@ -453,30 +526,18 @@ describe('/watch add', () => {
     expect(last(f.calls).payload.allowedMentions).toEqual({ parse: [] });
   });
 
-  it('applies options: name, interval, ping, subdomains, scope, max_pages', async () => {
-    await run({
-      sub: 'add',
-      options: { url: 'https://unpeg.io/docs', name: '  Unpeg   Docs ', interval: 60, ping: ROLE, subdomains: false, scope: 'docs/', max_pages: 20 },
-    });
+  it('applies options: name, interval, ping; defaults the channel to this one', async () => {
+    await run({ sub: 'add', options: { url: 'https://unpeg.io/docs', name: '  Unpeg   Docs ', interval: 60, ping: ROLE } });
     const [w] = store.listWatches(GUILD);
-    expect(w).toMatchObject({
-      url: 'https://unpeg.io/docs',
-      name: 'Unpeg Docs',
-      channelId: CHANNEL,
-      intervalSec: 60,
-      pingRoleId: ROLE,
-      scopePath: '/docs',
-      maxPages: 20,
-    });
-    expect(w.features.subdomains).toBe(false);
-    expect(w.features.pages).toBe(true);
+    expect(w).toMatchObject({ url: 'https://unpeg.io/docs', name: 'Unpeg Docs', channelId: CHANNEL, intervalSec: 60, pingRoleId: ROLE });
+    expect(w.features.subdomains).toBe(true);
   });
 
-  it('crawl:false tracks only the start URL', async () => {
-    await run({ sub: 'add', options: { url: 'unpeg.io', crawl: false, max_pages: 50 } });
-    const [w] = store.listWatches(GUILD);
-    expect(w.features.pages).toBe(false);
-    expect(w.maxPages).toBe(1);
+  it('uses the configured default and minimum interval (seconds-level checks)', async () => {
+    deps.config = testConfig({ minIntervalSec: 1, defaultIntervalSec: 2 });
+    await run({ sub: 'add', options: { url: 'a.io' } });
+    await run({ sub: 'add', options: { url: 'b.io', interval: 1 } });
+    expect(store.listWatches(GUILD).map((w) => w.intervalSec)).toEqual([2, 1]);
   });
 
   it.each([
@@ -512,12 +573,10 @@ describe('/watch add', () => {
   });
 
   it.each([
-    [{ interval: 5 }, '`interval` must be between 10 and 3600s'],
-    [{ interval: 3601 }, '`interval` must be between 10 and 3600s'],
-    [{ max_pages: 0 }, '`max_pages` must be between 1 and 1000'],
+    [{ interval: 5 }, 'The check interval must be between 10 and 3600 seconds'],
+    [{ interval: 3601 }, 'The check interval must be between 10 and 3600 seconds'],
     [{ name: '123' }, 'cannot be just a number'],
     [{ name: '   ' }, 'cannot be empty'],
-    [{ scope: '/has space' }, 'path prefix'],
   ])('validates %o', async (extra, msg) => {
     const f = await run({ sub: 'add', options: { url: 'unpeg.io', ...extra } });
     expect(textOf(last(f.calls))).toContain(msg);
@@ -570,9 +629,10 @@ describe('/watch add', () => {
     expect(second.features.subdomains).toBe(false);
     const text = textOf(last(f.calls));
     expect(text).toContain(`already tracked by **#${first.id} Unpeg**`);
+    expect(text).toContain('🧩 Features');
 
-    // Explicit subdomains:true is honoured; a different site is unaffected.
-    await run({ sub: 'add', options: { url: 'app.unpeg.io', subdomains: true } });
+    // An explicit subdomains:true is honoured; a different site is unaffected.
+    prepareAdd(deps, { guildId: GUILD, channelId: CHANNEL, userId: USER, url: 'app.unpeg.io', subdomains: true });
     await run({ sub: 'add', options: { url: 'other.io' } });
     const byHost = Object.fromEntries(store.listWatches(GUILD).map((w) => [w.host, w.features.subdomains]));
     expect(byHost['app.unpeg.io']).toBe(true);
@@ -635,12 +695,33 @@ describe('/watch add', () => {
   });
 });
 
+describe('prepareAdd (shared with the dashboard)', () => {
+  const req = (over: Partial<Parameters<typeof prepareAdd>[1]> = {}) => ({ guildId: GUILD, channelId: ALERTS, userId: USER, url: 'unpeg.io', ...over });
+
+  it('supports crawl:false, scope and max pages', () => {
+    const { watch } = prepareAdd(deps, req({ crawl: false, scope: 'docs/', maxPages: 50 }));
+    expect(watch).toMatchObject({ maxPages: 1, scopePath: '/docs' });
+    expect(watch.features.pages).toBe(false);
+    const other = prepareAdd(deps, req({ url: 'b.io', maxPages: 20 })).watch;
+    expect(other.maxPages).toBe(20);
+  });
+
+  it.each([
+    [{ maxPages: 0 }, 'Max pages must be between 1 and 1000'],
+    [{ scope: '/has space' }, 'path prefix'],
+    [{ intervalSec: 2.5 }, 'The check interval must be between'],
+  ])('validates %o synchronously without storing anything', (extra, msg) => {
+    expect(() => prepareAdd(deps, req(extra))).toThrow(msg);
+    expect(store.listWatches()).toHaveLength(0);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Other subcommands
 // ---------------------------------------------------------------------------
 
 describe('delivery problems', () => {
-  it('info, check and list warn when the alert channel was deleted', async () => {
+  it('check and list warn when the alert channel was deleted', async () => {
     makeWatch();
     const withGuild = async (o: ChatOpts) => {
       const f = fakeChat(o, timeline);
@@ -648,13 +729,12 @@ describe('delivery problems', () => {
       await handleChatInput(f.i, deps);
       return f;
     };
-    expect(textOf(last((await withGuild({ sub: 'info', options: { site: 'Unpeg' } })).calls))).toContain(`alert channel <#${ALERTS}> no longer exists`);
-    expect(textOf(last((await withGuild({ sub: 'check', options: { site: 'Unpeg' } })).calls))).toContain('no longer exists');
+    expect(textOf(last((await withGuild({ sub: 'check', options: { site: 'Unpeg' } })).calls))).toContain(`alert channel <#${ALERTS}> no longer exists`);
     expect(textOf(last((await withGuild({ sub: 'list' })).calls))).toContain(`<#${ALERTS}> ⚠️`);
   });
 });
 
-describe('/watch remove, list, pause, resume', () => {
+describe('/watch remove, list, help', () => {
   it('remove deletes the watch and stops its loops', async () => {
     const w = makeWatch();
     const f = await run({ sub: 'remove', options: { site: String(w.id) } });
@@ -683,30 +763,23 @@ describe('/watch remove, list, pause, resume', () => {
   it('list with no watches explains how to add one', async () => {
     const f = await run({ sub: 'list' });
     expect(textOf(last(f.calls))).toContain('/watch add');
+    expect(textOf(last(f.calls))).toContain('/panel');
   });
 
-  it('pause / resume update the watch and the monitor', async () => {
-    const w = makeWatch();
-    let f = await run({ sub: 'pause', options: { site: 'unpeg' } });
-    expect(store.getWatch(w.id)!.paused).toBe(true);
-    expect(mon.calls.updated.at(-1)).toMatchObject({ id: w.id, paused: true });
-    expect(textOf(last(f.calls))).toContain('Paused **Unpeg**');
-
-    f = await run({ sub: 'pause', options: { site: 'unpeg' } });
-    expect(textOf(last(f.calls))).toContain('already paused');
+  it('help is an ephemeral embed describing the dashboard and the commands', async () => {
+    const f = await run({ sub: 'help' });
     expect(isEphemeral(last(f.calls))).toBe(true);
-    expect(mon.calls.updated).toHaveLength(1);
-
-    f = await run({ sub: 'resume', options: { site: 'https://unpeg.io' } });
-    expect(store.getWatch(w.id)!.paused).toBe(false);
-    expect(mon.calls.updated.at(-1)).toMatchObject({ paused: false });
-    expect(textOf(last(f.calls))).toContain('Resumed **Unpeg**');
+    const text = textOf(last(f.calls));
+    expect(text).toContain('Redeploys');
+    expect(text).toContain('/panel');
+    expect(text).toContain('/watch add');
+    expect(text).not.toContain('/watch set');
   });
 });
 
-describe('/watch info, pages, subdomains, history, help', () => {
-  it('info shows settings, counts, state and runtime (ephemeral)', async () => {
-    const w = makeWatch('https://unpeg.io/', { pingRoleId: ROLE, ignorePatterns: ['Last updated.*'], extraUrls: ['https://unpeg.io/secret'] });
+describe('renderers (site card, pages, subdomains, history)', () => {
+  it('site card shows status, schedule, delivery, counts, build, rules, checks and runtime', () => {
+    const w = makeWatch('https://unpeg.io/', { pingRoleId: ROLE, ignorePatterns: ['Last updated.*'], extraUrls: ['https://unpeg.io/secret'], features: { files: false } });
     store.upsertPages([
       page(w.id, 'https://unpeg.io/', { title: 'Home' }),
       page(w.id, 'https://unpeg.io/docs', { dynamic: true }),
@@ -721,35 +794,44 @@ describe('/watch info, pages, subdomains, history, help', () => {
     state.lastError = 'boom `x`';
     store.saveState(w.id, state);
 
-    const f = await run({ sub: 'info', options: { site: 'Unpeg' } });
-    expect(isEphemeral(last(f.calls))).toBe(true);
-    const text = textOf(last(f.calls));
-    expect(text).toContain(`#${w.id} Unpeg`);
-    expect(text).toContain(`Channel: <#${ALERTS}>`);
-    expect(text).toContain('Schedule: every 30s · all pages ~2m');
+    const e = renderSiteInfo(deps, store.getWatch(w.id)!);
+    const text = textOf({ type: 'reply', payload: { embeds: [e] } });
+    expect(e.title).toBe('🟢 Unpeg');
+    expect(text).toContain('🟢 **Up** · last check <t:1700000000:R> · last change never');
+    expect(text).toContain('Schedule: every 30s\nall pages ~2m');
+    expect(text).toContain(`Alerts: <#${ALERTS}>\nping: <@&${ROLE}>`);
     expect(text).toContain('Pages: 3 tracked (max 150) · 4 known\n1 files · 1 gone · 1 too dynamic');
     expect(text).toContain('Subdomains: 2 known · 1 live');
     expect(text).toContain('`KU79xyz` · 2 bundles · Next.js');
-    expect(text).toContain('Last check: <t:1700000000:R>');
-    expect(text).toContain('Last change: never');
-    expect(text).toContain(`Ping: <@&${ROLE}>`);
+    expect(text).toContain('1 ignore pattern\n0 skipped URL patterns\n1 extra page\nscope: whole site');
+    expect(text).toContain('✅ Redeploys');
+    expect(text).toContain('⬜ Files');
+    expect(text).toContain('⬜ Ignore numbers');
     expect(text).toContain('Last error: `boom ˋxˋ`');
-    expect(text).toContain('Ignored text: `Last updated.*`');
-    expect(text).toContain('Extra pages: https://unpeg.io/secret');
     expect(text).toContain('Runtime: running · last check took 850ms · next <t:');
-    expect(text).toContain('✅ redeploys');
+    expect(e.footer!.text).toContain(`#${w.id} · unpeg.io`);
   });
 
-  it('info survives a monitor without runtime info', async () => {
-    makeWatch();
+  it('site card status: paused, first scan pending, down; survives a monitor without runtime info', () => {
+    const w = makeWatch();
     mon.runtimeImpl = () => {
       throw new Error('not implemented');
     };
-    const f = await run({ sub: 'info', options: { site: 'Unpeg' } });
-    expect(textOf(last(f.calls))).toContain('Runtime: unknown');
+    const state = defaultWatchState();
+    state.status.up = false;
+    state.status.lastError = 'HTTP 502';
+    state.status.downSince = 1_700_000_000_000;
+    store.saveState(w.id, state);
+    let e = renderSiteInfo(deps, store.getWatch(w.id)!);
+    expect(e.description).toContain('🔴 **Down** since <t:1700000000:R> (HTTP 502)');
+    expect(e.fields!.find((f) => f.name === 'Runtime')!.value).toBe('unknown');
+    e = renderSiteInfo(deps, store.updateWatch(w.id, { paused: true }));
+    expect(e.title).toBe('⏸️ Unpeg');
+    e = renderSiteInfo(deps, store.updateWatch(w.id, { paused: false, baselineDone: false }));
+    expect(e.description).toContain('⏳ **First scan pending**');
   });
 
-  it('pages lists tracked pages with counts (ephemeral)', async () => {
+  it('pages lists tracked pages with counts and caps the list at 40', () => {
     const w = makeWatch();
     store.upsertPages([
       page(w.id, 'https://unpeg.io/', { title: 'Home *page*', depth: 0 }),
@@ -757,57 +839,38 @@ describe('/watch info, pages, subdomains, history, help', () => {
       page(w.id, 'https://unpeg.io/known', { tracked: false }),
       page(w.id, 'https://unpeg.io/w.pdf', { kind: 'file', text: null }),
     ]);
-    const f = await run({ sub: 'pages', options: { site: 'Unpeg' } });
-    expect(isEphemeral(last(f.calls))).toBe(true);
-    const text = textOf(last(f.calls));
+    const text = textOf({ type: 'reply', payload: { embeds: [renderPages(deps, w)] } });
     expect(text).toContain('**2** tracked · **3** known · **1** files · **0** gone · **1** too dynamic to diff');
     expect(text).toContain('`/` · Home \\*page\\*');
     expect(text).toContain('`/docs` · _dynamic_');
     expect(text).toContain('Files: `/w.pdf`');
-  });
 
-  it('pages caps the list at 40', async () => {
-    const w = makeWatch();
-    store.upsertPages(Array.from({ length: 55 }, (_, n) => page(w.id, `https://unpeg.io/p${n}`)));
-    const f = await run({ sub: 'pages', options: { site: 'Unpeg' } });
-    const desc: string = last(f.calls).payload.embeds[0].description;
+    const big = makeWatch('https://big.unpeg.io/', { name: 'Big' });
+    store.upsertPages(Array.from({ length: 55 }, (_, n) => page(big.id, `https://big.unpeg.io/p${n}`)));
+    const desc = renderPages(deps, big).description!;
     expect(desc.split('\n').filter((l) => l.startsWith('`/p'))).toHaveLength(40);
-    expect(desc).toContain('…and 15 more');
+    expect(desc).toMatch(/…and \d+ more/);
   });
 
-  it('subdomains lists live hosts first (ephemeral)', async () => {
+  it('subdomains lists live hosts first', () => {
     const w = makeWatch();
     store.upsertSubdomains([
       subdomain(w.id, 'a.unpeg.io', false, { sources: ['dns'] }),
       subdomain(w.id, 'b.unpeg.io', true, { sources: ['ct', 'code'] }),
     ]);
-    const f = await run({ sub: 'subdomains', options: { site: 'Unpeg' } });
-    expect(isEphemeral(last(f.calls))).toBe(true);
-    const text = textOf(last(f.calls));
+    const text = renderSubdomains(deps, w).description!;
     expect(text).toContain('**2** known · **1** live');
     expect(text.indexOf('🟢 `b.unpeg.io` · CT, code')).toBeLessThan(text.indexOf('⚪ `a.unpeg.io` · DNS'));
+    expect(renderSubdomains(deps, store.updateWatch(w.id, { features: { subdomains: false } })).description).toContain('🧩 Features');
   });
 
-  it('history shows newest first and honours limit', async () => {
+  it('history shows newest first and honours the limit', () => {
     const w = makeWatch();
+    expect(renderHistory(deps, w).description).toContain('No alerts yet');
     store.addEvent(w.id, 'deploy', 'redeployed: build a → b', 1_700_000_000_000);
     store.addEvent(w.id, 'text', 'text changed on /docs', 1_700_000_100_000);
     store.addEvent(w.id, 'new_pages', '1 new page: /x_y', 1_700_000_200_000);
-    const f = await run({ sub: 'history', options: { site: 'Unpeg', limit: 2 } });
-    expect(isEphemeral(last(f.calls))).toBe(true);
-    expect(last(f.calls).payload.embeds[0].description).toBe(
-      '<t:1700000200:R> 🆕 1 new page: /x\\_y\n<t:1700000100:R> 📝 text changed on /docs',
-    );
-    const empty = await run({ sub: 'history', options: { site: 'Unpeg', limit: 30 } });
-    expect(textOf(last(empty.calls))).toContain('between 1 and 25');
-  });
-
-  it('help is an ephemeral embed', async () => {
-    const f = await run({ sub: 'help' });
-    expect(isEphemeral(last(f.calls))).toBe(true);
-    const text = textOf(last(f.calls));
-    expect(text).toContain('Redeploys');
-    expect(text).toContain('/watch add');
+    expect(renderHistory(deps, w, 2).description).toBe('<t:1700000200:R> 🆕 1 new page: /x\\_y\n<t:1700000100:R> 📝 text changed on /docs');
   });
 });
 
@@ -875,131 +938,6 @@ describe('/watch check', () => {
     expect(last(f.calls)).toMatchObject({ type: 'edit' });
     expect(last(f.calls).payload.content).toBe('⚠️ boom');
     expect(log.entries.some((e) => e.level === 'error' && e.msg.includes('/watch check'))).toBe(true);
-  });
-});
-
-describe('/watch set', () => {
-  it('applies and reports changes', async () => {
-    const w = makeWatch();
-    const f = await run({
-      sub: 'set',
-      options: { site: 'Unpeg', interval: 60, sweep: 600, text: false, code_intel: false, ping: ROLE, ignore_numbers: true, scope: '/docs/', channel: CHANNEL, name: 'Unpeg Main', max_pages: 300 },
-    });
-    const updated = store.getWatch(w.id)!;
-    expect(updated).toMatchObject({ intervalSec: 60, sweepSec: 600, pingRoleId: ROLE, maskNumbers: true, scopePath: '/docs', channelId: CHANNEL, name: 'Unpeg Main', maxPages: 300 });
-    expect(updated.features).toMatchObject({ text: false, codeIntel: false, deploy: true, subdomains: true });
-    expect(mon.calls.updated).toHaveLength(1);
-    const text = textOf(last(f.calls));
-    expect(isEphemeral(last(f.calls))).toBe(false);
-    for (const s of ['interval: 30s → 60s', 'full sweep: 120s → 600s', 'text changes: off', 'code intel: off', `ping: none → <@&${ROLE}>`, 'scope: whole site → `/docs`', `channel: <#${ALERTS}> → <#${CHANNEL}>`, 'name: **Unpeg** → **Unpeg Main**', 'max pages: 150 → 300', 'ignore number-only changes: on']) {
-      expect(text).toContain(s);
-    }
-  });
-
-  it('clears ping and scope', async () => {
-    const w = makeWatch('https://unpeg.io/', { pingRoleId: ROLE, scopePath: '/docs' });
-    await run({ sub: 'set', options: { site: 'Unpeg', clear_ping: true, scope: 'none' } });
-    expect(store.getWatch(w.id)).toMatchObject({ pingRoleId: null, scopePath: null });
-  });
-
-  it('rejects conflicting / invalid / empty input', async () => {
-    const w = makeWatch();
-    makeWatch('https://beta.unpeg.io/', { name: 'Beta' });
-    const cases: Array<[Record<string, unknown>, string]> = [
-      [{ ping: ROLE, clear_ping: true }, 'not both'],
-      [{ sweep: 10 }, '`sweep` must be between 30 and 86400s'],
-      [{ interval: 9 }, '`interval` must be between 10 and 3600s'],
-      [{ name: 'beta' }, 'already exists'],
-      [{}, 'Nothing to change'],
-      [{ text: true, interval: 30 }, 'Nothing to change'],
-    ];
-    for (const [options, msg] of cases) {
-      const f = await run({ sub: 'set', options: { site: String(w.id), ...options } });
-      expect(textOf(last(f.calls))).toContain(msg);
-      expect(isEphemeral(last(f.calls))).toBe(true);
-    }
-    expect(mon.calls.updated).toHaveLength(0);
-  });
-});
-
-describe('/watch ignore & exclude', () => {
-  it('adds a valid ignore pattern, resets page noise and re-baselines', async () => {
-    const w = makeWatch();
-    store.upsertPage(page(w.id, 'https://unpeg.io/', { dynamic: true, flapCount: 3 }));
-    const f = await run({ sub: 'ignore', options: { site: 'Unpeg', pattern: 'Last updated.*' } });
-    expect(store.getWatch(w.id)!.ignorePatterns).toEqual(['Last updated.*']);
-    const p = store.getPage(w.id, 'https://unpeg.io/')!;
-    expect(p).toMatchObject({ dynamic: false, flapCount: 0, textHash: null });
-    expect(mon.calls.updated.at(-1)?.ignorePatterns).toEqual(['Last updated.*']);
-    expect(textOf(last(f.calls))).toContain('now ignores text matching `Last updated.*`');
-  });
-
-  it.each([
-    ['(', 'Invalid regex'],
-    ['(a+)+$', 'nested repetition'],
-    ['(\\w*)*', 'nested repetition'],
-    ['(a|a)*$', 'too slow'],
-    ['a*a*a*a*b', 'too slow'],
-    ['.*', 'matches whole lines'],
-    ['[\\s\\S]+', 'matches whole lines'],
-    ['x'.repeat(301), 'too long'],
-  ])('rejects ignore pattern %s', async (pattern, msg) => {
-    const w = makeWatch();
-    const f = await run({ sub: 'ignore', options: { site: 'Unpeg', pattern } });
-    expect(textOf(last(f.calls))).toContain(msg);
-    expect(isEphemeral(last(f.calls))).toBe(true);
-    expect(store.getWatch(w.id)!.ignorePatterns).toEqual([]);
-  });
-
-  it('removes patterns and rejects duplicates / unknown ones / too many', async () => {
-    const w = makeWatch('https://unpeg.io/', { ignorePatterns: ['a\\d+'] });
-    let f = await run({ sub: 'ignore', options: { site: 'Unpeg', pattern: 'a\\d+' } });
-    expect(textOf(last(f.calls))).toContain('already in the list');
-    f = await run({ sub: 'ignore', options: { site: 'Unpeg', pattern: 'zzz', remove: true } });
-    expect(textOf(last(f.calls))).toContain('is not in the list');
-    f = await run({ sub: 'ignore', options: { site: 'Unpeg', pattern: 'a\\d+', remove: true } });
-    expect(store.getWatch(w.id)!.ignorePatterns).toEqual([]);
-    expect(textOf(last(f.calls))).toContain('no longer ignores');
-
-    store.updateWatch(w.id, { ignorePatterns: Array.from({ length: 25 }, (_, n) => `p${n}`) });
-    f = await run({ sub: 'ignore', options: { site: 'Unpeg', pattern: 'one-more' } });
-    expect(textOf(last(f.calls))).toContain('At most 25 patterns');
-  });
-
-  it('exclude validates URL patterns and warns when the start URL matches', async () => {
-    const w = makeWatch();
-    let f = await run({ sub: 'exclude', options: { site: 'Unpeg', pattern: '/blog/' } });
-    expect(store.getWatch(w.id)!.excludePatterns).toEqual(['/blog/']);
-    expect(textOf(last(f.calls))).toContain('now skips URLs matching `/blog/`');
-    f = await run({ sub: 'exclude', options: { site: 'Unpeg', pattern: '.' } });
-    expect(textOf(last(f.calls))).toContain('matches every URL');
-    f = await run({ sub: 'exclude', options: { site: 'Unpeg', pattern: 'unpeg\\.io/$' } });
-    expect(textOf(last(f.calls))).toContain('also matches the start URL');
-    f = await run({ sub: 'exclude', options: { site: 'Unpeg', pattern: '/blog/', remove: true } });
-    expect(store.getWatch(w.id)!.excludePatterns).toEqual(['unpeg\\.io/$']);
-  });
-});
-
-describe('/watch addpage', () => {
-  it('resolves relative paths and host-like inputs, rejects bad schemes', async () => {
-    const w = makeWatch();
-    await run({ sub: 'addpage', options: { site: 'Unpeg', url: '/docs/secret/' } });
-    await run({ sub: 'addpage', options: { site: 'Unpeg', url: 'unpeg.io/airdrop' } });
-    await run({ sub: 'addpage', options: { site: 'Unpeg', url: 'https://cdn.other.io/paper.pdf' } });
-    expect(store.getWatch(w.id)!.extraUrls).toEqual(['https://unpeg.io/docs/secret', 'https://unpeg.io/airdrop', 'https://cdn.other.io/paper.pdf']);
-    expect(mon.calls.updated).toHaveLength(3);
-
-    for (const url of ['javascript:alert(1)', 'ftp://unpeg.io/x', 'has space']) {
-      const f = await run({ sub: 'addpage', options: { site: 'Unpeg', url } });
-      expect(textOf(last(f.calls))).toContain('not a valid http(s) URL');
-    }
-    let f = await run({ sub: 'addpage', options: { site: 'Unpeg', url: 'https://unpeg.io/airdrop/' } });
-    expect(textOf(last(f.calls))).toContain('already tracked');
-    f = await run({ sub: 'addpage', options: { site: 'Unpeg', url: '/airdrop', remove: true } });
-    expect(store.getWatch(w.id)!.extraUrls).not.toContain('https://unpeg.io/airdrop');
-    expect(textOf(last(f.calls))).toContain('Stopped tracking <https://unpeg.io/airdrop>');
-    f = await run({ sub: 'addpage', options: { site: 'Unpeg', url: '/nope', remove: true } });
-    expect(textOf(last(f.calls))).toContain('is not an extra page');
   });
 });
 
@@ -1118,6 +1056,25 @@ describe('helpers', () => {
     expect(regexIsFast('(x+x+)+y', 'gi')).toBe(false);
     expect(regexIsFast('(a|a)*$', 'i')).toBe(false);
     expect(Date.now() - t0).toBeLessThan(2000);
+  });
+
+  it.each([
+    ['(', 'ignore', 'Invalid regex'],
+    ['(a+)+$', 'ignore', 'nested repetition'],
+    ['(\\w*)*', 'ignore', 'nested repetition'],
+    ['(a|a)*$', 'ignore', 'too slow'],
+    ['a*a*a*a*b', 'ignore', 'too slow'],
+    ['.*', 'ignore', 'matches whole lines'],
+    ['[\\s\\S]+', 'ignore', 'matches whole lines'],
+    ['x'.repeat(301), 'ignore', 'too long'],
+    ['.', 'exclude', 'matches every URL'],
+  ] as const)('validatePattern rejects %s (%s)', (pattern, kind, msg) => {
+    expect(() => validatePattern(pattern, kind)).toThrow(msg);
+  });
+
+  it('validatePattern accepts and trims ordinary patterns', () => {
+    expect(validatePattern('  Last updated.*  ', 'ignore')).toBe('Last updated.*');
+    expect(validatePattern('/blog/', 'exclude')).toBe('/blog/');
   });
 
   it('parseScope', () => {

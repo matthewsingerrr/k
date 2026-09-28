@@ -4,12 +4,15 @@
  * - Client intents: [GatewayIntentBits.Guilds] only (no privileged intents).
  * - On ClientReady: log "Logged in as <tag>", log the invite URL:
  *   https://discord.com/oauth2/authorize?client_id=<appId>&scope=bot%20applications.commands&permissions=<perms>
- *   with perms = ViewChannel|SendMessages|EmbedLinks|ReadMessageHistory|MentionEveryone (as a bigint string).
+ *   with perms = ViewChannel|SendMessages|EmbedLinks|ReadMessageHistory|MentionEveryone|AttachFiles|PinMessages (bigint string);
+ *   AttachFiles + PinMessages are for the pinned dashboard message and its watch-list backup attachment.
  *   Register commands: if config.discordGuildId → only that guild; else for every guild in the cache
  *   (guild.commands.set(defs)) — guild commands update instantly. Also on GuildCreate for newly joined guilds.
  *   Registration failures are logged, never fatal.
- * - InteractionCreate routing: chat input `/watch` → handleChatInput; autocomplete → handleAutocomplete;
- *   button with customId starting "watchsub:" → handleButton. Wrap each in try/catch; on error reply/followUp ephemeral if possible.
+ * - InteractionCreate routing: chat input `/watch` and `/panel` → handleChatInput; autocomplete → handleAutocomplete;
+ *   button with customId starting "watchsub:" → handleButton; dashboard buttons/selects ("panel:" custom_id) →
+ *   handlePanelComponent; dashboard modal submits → handlePanelModal. Wrap each in try/catch; on error reply/followUp
+ *   ephemeral if possible.
  * - `client.on('error'|'warn'|'shardDisconnect'|'shardReconnecting'|'shardResume')` logged.
  * - The `monitor` may be constructed before the client is ready: `startBot` accepts a factory so commands can reach it.
  * - A failed initial login is fatal (the process exits with code 1 so Railway restarts it and the logs show why): a failed
@@ -50,16 +53,33 @@ import type { Config } from '../config.js';
 import type { Store } from '../db/store.js';
 import type { Monitor } from '../monitor/scheduler.js';
 import type { Alert, Logger, Notifier, Watch } from '../types.js';
-import { COMMAND_NAME, UserError, commandDefinitions, handleAutocomplete, handleButton, handleChatInput, type CommandDeps } from './commands.js';
+import {
+  COMMAND_NAME,
+  PANEL_COMMAND_NAME,
+  UserError,
+  commandDefinitions,
+  handleAutocomplete,
+  handleButton,
+  handleChatInput,
+  type CommandDeps,
+} from './commands.js';
 import { WATCH_SUB_PREFIX, formatAlerts, truncate, type MessagePayload } from './format.js';
+import { handlePanelComponent, handlePanelModal, isPanelCustomId, type PanelHost } from './panel.js';
 
-/** Permissions requested by the invite link. MentionEveryone lets the bot ping roles that aren't "mentionable". */
+/**
+ * Permissions requested by the invite link. MentionEveryone lets the bot ping roles that aren't "mentionable"; AttachFiles and
+ * PinMessages (ManageMessages on library versions without the dedicated flag) are for the pinned dashboard + its backup file.
+ */
+const PIN_PERMISSION: bigint =
+  (PermissionFlagsBits as unknown as Record<string, bigint | undefined>).PinMessages ?? PermissionFlagsBits.ManageMessages;
 export const BOT_PERMISSIONS =
   PermissionFlagsBits.ViewChannel |
   PermissionFlagsBits.SendMessages |
   PermissionFlagsBits.EmbedLinks |
   PermissionFlagsBits.ReadMessageHistory |
-  PermissionFlagsBits.MentionEveryone;
+  PermissionFlagsBits.MentionEveryone |
+  PermissionFlagsBits.AttachFiles |
+  PIN_PERMISSION;
 
 export function inviteUrl(appId: string): string {
   return (
@@ -392,6 +412,8 @@ export interface RouteDeps {
   config: Config;
   log: Logger;
   getMonitor: () => Monitor;
+  /** Owner of the persistent dashboard message (null until it exists). */
+  getPanelHost?: () => PanelHost | null;
 }
 
 /** Command deps whose `monitor` is resolved lazily, so a not-yet-started monitor yields a friendly error, not a crash. */
@@ -407,6 +429,13 @@ function commandDeps(d: RouteDeps): CommandDeps {
         throw new UserError('The bot is still starting up — try again in a few seconds.');
       }
     },
+    get panel(): PanelHost | null {
+      try {
+        return d.getPanelHost?.() ?? null;
+      } catch {
+        return null;
+      }
+    },
   };
 }
 
@@ -420,11 +449,21 @@ export async function routeInteraction(interaction: Interaction, d: RouteDeps): 
       return;
     }
     if (interaction.isChatInputCommand()) {
-      if (interaction.commandName === COMMAND_NAME) await handleChatInput(interaction, commandDeps(d));
+      if (interaction.commandName === COMMAND_NAME || interaction.commandName === PANEL_COMMAND_NAME) {
+        await handleChatInput(interaction, commandDeps(d));
+      }
+      return;
+    }
+    if (interaction.isModalSubmit()) {
+      if (isPanelCustomId(interaction.customId)) await handlePanelModal(interaction, commandDeps(d));
       return;
     }
     if (interaction.isButton() && interaction.customId.startsWith(WATCH_SUB_PREFIX)) {
       await handleButton(interaction, commandDeps(d));
+      return;
+    }
+    if ((interaction.isButton() || interaction.isAnySelectMenu()) && isPanelCustomId(interaction.customId)) {
+      await handlePanelComponent(interaction, commandDeps(d));
     }
   } catch (err) {
     d.log.error('interaction handler crashed', { err: err instanceof Error ? err : String(err) });
@@ -459,6 +498,8 @@ export async function startBot(deps: {
   store: Store;
   log: Logger;
   getMonitor: () => Monitor;
+  /** Owner of the persistent dashboard message (see backup.ts); may return null until it is created. */
+  getPanelHost?: () => PanelHost | null;
   exit?: (code: number) => void;
 }): Promise<BotHandle> {
   const { config, log } = deps;
@@ -543,7 +584,7 @@ export async function startBot(deps: {
     setGuildWatchesRunning(guild.id, false, deps);
   });
 
-  const routeDeps: RouteDeps = { store: deps.store, config, log, getMonitor: deps.getMonitor };
+  const routeDeps: RouteDeps = { store: deps.store, config, log, getMonitor: deps.getMonitor, getPanelHost: deps.getPanelHost };
   client.on(Events.InteractionCreate, (interaction) => {
     void routeInteraction(interaction, routeDeps);
   });

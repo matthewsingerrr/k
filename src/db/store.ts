@@ -47,9 +47,9 @@ export const MAX_STORED_TEXT_CHARS = 500_000;
 /** Event summaries are capped at this many chars. */
 const MAX_EVENT_SUMMARY_CHARS = 4000;
 /** Current schema version (= number of migrations). */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
-const BUILTIN_DEFAULTS: StoreDefaults = { intervalSec: 30, sweepSec: 120, maxPages: 150 };
+const BUILTIN_DEFAULTS: StoreDefaults = { intervalSec: 2, sweepSec: 120, maxPages: 150 };
 
 type Db = Database.Database;
 type Stmt = Database.Statement;
@@ -159,7 +159,26 @@ const MIGRATIONS: Array<(db: Db) => void> = [
     if (!cols.has('change_times_json')) db.exec(`ALTER TABLE pages ADD COLUMN change_times_json TEXT NOT NULL DEFAULT '[]'`);
     if (!cols.has('masked_lines_json')) db.exec(`ALTER TABLE pages ADD COLUMN masked_lines_json TEXT NOT NULL DEFAULT '[]'`);
   },
+  // v3: per-guild dashboard/backup message location; watches still on the old 30s default move to the new 2s default
+  (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS guild_settings (
+        guild_id TEXT PRIMARY KEY,
+        panel_channel_id TEXT,
+        panel_message_id TEXT,
+        updated_at INTEGER NOT NULL DEFAULT 0
+      );
+      UPDATE watches SET interval_sec = 2 WHERE interval_sec = 30;
+    `);
+  },
 ];
+
+export interface GuildSettings {
+  guildId: string;
+  panelChannelId: string | null;
+  panelMessageId: string | null;
+  updatedAt: number;
+}
 
 // ---------------------------------------------------------------------------
 // Row shapes
@@ -438,6 +457,50 @@ export class Store {
     }
   }
 
+  private readonly watchListeners = new Set<(guildId: string) => void>();
+
+  /** Subscribe to watch-list changes (create / update / delete) of a guild. Returns an unsubscribe function. */
+  onWatchesChanged(cb: (guildId: string) => void): () => void {
+    this.watchListeners.add(cb);
+    return () => this.watchListeners.delete(cb);
+  }
+
+  private emitWatchesChanged(guildId: string): void {
+    for (const cb of this.watchListeners) {
+      try {
+        cb(guildId);
+      } catch {
+        // listeners must never break a write
+      }
+    }
+  }
+
+  // --- guild settings (dashboard / backup message) ---------------------------
+
+  getGuildSettings(guildId: string): GuildSettings | undefined {
+    const row = this.stmt(`SELECT guild_id, panel_channel_id, panel_message_id, updated_at FROM guild_settings WHERE guild_id = ?`).get(
+      String(guildId),
+    ) as { guild_id: string; panel_channel_id: string | null; panel_message_id: string | null; updated_at: number } | undefined;
+    if (!row) return undefined;
+    return { guildId: row.guild_id, panelChannelId: row.panel_channel_id, panelMessageId: row.panel_message_id, updatedAt: row.updated_at };
+  }
+
+  setGuildSettings(guildId: string, patch: { panelChannelId?: string | null; panelMessageId?: string | null }): GuildSettings {
+    const cur = this.getGuildSettings(guildId);
+    const next: GuildSettings = {
+      guildId: String(guildId),
+      panelChannelId: patch.panelChannelId !== undefined ? patch.panelChannelId : (cur?.panelChannelId ?? null),
+      panelMessageId: patch.panelMessageId !== undefined ? patch.panelMessageId : (cur?.panelMessageId ?? null),
+      updatedAt: Date.now(),
+    };
+    this.stmt(
+      `INSERT INTO guild_settings (guild_id, panel_channel_id, panel_message_id, updated_at) VALUES (@guildId, @panelChannelId, @panelMessageId, @updatedAt)
+       ON CONFLICT(guild_id) DO UPDATE SET panel_channel_id = excluded.panel_channel_id, panel_message_id = excluded.panel_message_id,
+         updated_at = excluded.updated_at`,
+    ).run(next);
+    return next;
+  }
+
   private stmt(sql: string): Stmt {
     let s = this.stmts.get(sql);
     if (!s) {
@@ -500,6 +563,7 @@ export class Store {
     })();
     const w = this.getWatch(id);
     if (!w) throw new Error(`watch ${id} vanished right after insert`);
+    this.emitWatchesChanged(w.guildId);
     return w;
   }
 
@@ -622,13 +686,17 @@ export class Store {
       paused: b01(next.paused),
       baselineDone: b01(next.baselineDone),
     });
-    return this.getWatch(id) ?? next;
+    const updated = this.getWatch(id) ?? next;
+    this.emitWatchesChanged(updated.guildId);
+    return updated;
   }
 
   /** Delete a watch and all of its rows (cascade). */
   deleteWatch(id: number): void {
     if (!Number.isSafeInteger(id)) return;
+    const guildId = this.getWatch(id)?.guildId;
     this.stmt(`DELETE FROM watches WHERE id = ?`).run(id);
+    if (guildId !== undefined) this.emitWatchesChanged(guildId);
   }
 
   // --- state ---------------------------------------------------------------

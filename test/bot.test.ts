@@ -331,17 +331,22 @@ describe('inviteUrl', () => {
         PermissionFlagsBits.SendMessages |
         PermissionFlagsBits.EmbedLinks |
         PermissionFlagsBits.ReadMessageHistory |
-        PermissionFlagsBits.MentionEveryone,
+        PermissionFlagsBits.MentionEveryone |
+        PermissionFlagsBits.AttachFiles |
+        PermissionFlagsBits.PinMessages,
     );
     expect(inviteUrl('123')).toBe(
       `https://discord.com/oauth2/authorize?client_id=123&scope=bot%20applications.commands&permissions=${BOT_PERMISSIONS.toString()}`,
     );
-    expect(BOT_PERMISSIONS.toString()).toBe('216064');
+    expect(BOT_PERMISSIONS.toString()).toBe('2251799813934080');
+    // The dashboard needs to attach its backup file and pin itself; nothing broader than that.
+    expect(BOT_PERMISSIONS & PermissionFlagsBits.Administrator).toBe(0n);
+    expect(BOT_PERMISSIONS & PermissionFlagsBits.ManageMessages).toBe(0n);
   });
 });
 
 describe('routeInteraction', () => {
-  function baseInteraction(kind: 'chat' | 'auto' | 'button', over: Record<string, unknown> = {}) {
+  function baseInteraction(kind: 'chat' | 'auto' | 'button' | 'select' | 'modal', over: Record<string, unknown> = {}) {
     const calls: Array<{ type: string; payload: any }> = []; // eslint-disable-line @typescript-eslint/no-explicit-any
     const i = {
       commandName: 'watch',
@@ -357,7 +362,13 @@ describe('routeInteraction', () => {
       isAutocomplete: () => kind === 'auto',
       isChatInputCommand: () => kind === 'chat',
       isButton: () => kind === 'button',
+      isAnySelectMenu: () => kind === 'select',
+      isStringSelectMenu: () => kind === 'select',
+      isModalSubmit: () => kind === 'modal',
+      isFromMessage: () => false,
       isRepliable: () => kind !== 'auto',
+      values: [] as string[],
+      fields: { getTextInputValue: () => '' },
       options: {
         getSubcommand: () => 'check',
         getString: (n: string) => (n === 'site' ? 'Unpeg' : null),
@@ -381,6 +392,12 @@ describe('routeInteraction', () => {
       },
       async respond(payload: unknown) {
         calls.push({ type: 'respond', payload });
+      },
+      async showModal(payload: unknown) {
+        calls.push({ type: 'modal', payload });
+      },
+      async deferUpdate() {
+        calls.push({ type: 'deferUpdate', payload: null });
       },
       ...over,
     };
@@ -434,6 +451,61 @@ describe('routeInteraction', () => {
     await routeInteraction(otherButton.i, d);
     expect(other.calls).toHaveLength(0);
     expect(otherButton.calls).toHaveLength(0);
+  });
+
+  it('routes /panel, dashboard buttons, selects and modal submits to the panel', async () => {
+    const placed: string[] = [];
+    const refreshed: string[] = [];
+    const host = {
+      placePanel: async (g: string, c: string) => (placed.push(`${g}/${c}`), `https://discord.com/channels/${g}/${c}/1`),
+      refresh: (g: string) => refreshed.push(g),
+    };
+    const monitor = { runtimeInfo: () => ({ running: true, lastTickAt: null, lastTickMs: null, nextTickAt: null, baselineRunning: false }) } as unknown as Monitor;
+    const d = { ...routeDeps(() => monitor), getPanelHost: () => host };
+
+    const panel = baseInteraction('chat', { commandName: 'panel' });
+    await routeInteraction(panel.i, d);
+    expect(placed).toEqual(['100000000000000001/200000000000000001']);
+    expect(panel.calls.at(-1)?.payload.content).toContain('https://discord.com/channels/100000000000000001/200000000000000001/1');
+
+    const help = baseInteraction('button', { customId: 'panel:help' });
+    await routeInteraction(help.i, d);
+    expect(help.calls.at(-1)?.payload.embeds[0].title).toContain('help');
+    expect(help.calls.at(-1)?.payload.flags).toBe(64);
+
+    const refresh = baseInteraction('button', { customId: 'panel:refresh' });
+    await routeInteraction(refresh.i, d);
+    expect(refreshed).toEqual(['100000000000000001']);
+    expect(refresh.calls.at(-1)?.type).toBe('deferUpdate');
+
+    const add = baseInteraction('button', { customId: 'panel:add' });
+    await routeInteraction(add.i, d);
+    expect(add.calls.at(-1)?.type).toBe('modal');
+
+    const pick = baseInteraction('select', { customId: 'panel:pick:0', values: ['1'] });
+    await routeInteraction(pick.i, d);
+    expect(pick.calls.at(-1)?.payload.embeds[0].title).toContain('Unpeg');
+    expect(pick.calls.at(-1)?.payload.flags).toBe(64);
+
+    const modal = baseInteraction('modal', { customId: 'panel:m:add' });
+    await routeInteraction(modal.i, d);
+    expect(modal.calls.at(-1)?.payload.content).toContain('Enter the website URL');
+
+    // Other selects / modals are not ours.
+    const foreignSelect = baseInteraction('select', { customId: 'other:1' });
+    const foreignModal = baseInteraction('modal', { customId: 'other' });
+    await routeInteraction(foreignSelect.i, d);
+    await routeInteraction(foreignModal.i, d);
+    expect(foreignSelect.calls).toHaveLength(0);
+    expect(foreignModal.calls).toHaveLength(0);
+  });
+
+  it('/panel without a dashboard host answers with an ephemeral error', async () => {
+    const d = routeDeps(() => ({}) as Monitor);
+    const { i, calls } = baseInteraction('chat', { commandName: 'panel' });
+    await routeInteraction(i, d);
+    expect(calls.at(-1)?.payload.content).toContain('not available right now');
+    expect(calls.at(-1)?.payload.flags).toBe(64);
   });
 
   it('ignores interactions from other servers when locked to DISCORD_GUILD_ID', async () => {

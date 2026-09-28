@@ -6,6 +6,8 @@ import { Store } from './db/store.js';
 import { HttpClient } from './net/http.js';
 import { Monitor } from './monitor/scheduler.js';
 import { startBot } from './discord/bot.js';
+import { PanelManager } from './discord/backup.js';
+import { Events } from 'discord.js';
 import { startHealthServer } from './health.js';
 
 async function main(): Promise<void> {
@@ -34,6 +36,7 @@ async function main(): Promise<void> {
   });
 
   let monitor: Monitor | null = null;
+  let panels: PanelManager | null = null;
   const bot = await startBot({
     config,
     store,
@@ -42,7 +45,20 @@ async function main(): Promise<void> {
       if (!monitor) throw new Error('monitor not started yet');
       return monitor;
     },
+    getPanelHost: () => panels,
   });
+
+  // Dashboard + watch-list backup in Discord: survives redeploys even without a Railway volume.
+  panels = new PanelManager({
+    client: bot.client,
+    store,
+    config,
+    log: log.child({ mod: 'panel' }),
+    getMonitor: () => monitor,
+    onRestored: (watch) => monitor?.onWatchAdded(watch),
+  });
+  void bot.ready.then(() => panels?.start()).catch((err) => log.error('dashboard start failed', { err }));
+  bot.client.on(Events.GuildCreate, (guild) => void panels?.onGuildAvailable(guild).catch(() => {}));
 
   monitor = new Monitor({ store, http, notifier: bot.notifier, config, log: log.child({ mod: 'monitor' }) });
 
@@ -107,6 +123,7 @@ async function main(): Promise<void> {
     clearInterval(loopWatch);
     loopDelay.disable();
     try {
+      panels?.stop();
       await monitor?.stop();
       // Give alerts still queued for Discord a last chance to go out.
       await Promise.race([bot.notifier.flush(), new Promise((r) => setTimeout(r, 3000).unref())]);

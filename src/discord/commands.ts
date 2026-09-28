@@ -1,55 +1,30 @@
 /**
- * Slash commands & component interactions.
+ * Slash commands + the shared building blocks the dashboard (panel.ts) reuses.
  *
- * One top-level command `/watch` (default_member_permissions = ManageGuild, dm_permission false) with subcommands:
- *   add     url:string(req) name:string channel:channel(text/announcement) interval:int(seconds, min config.minIntervalSec, max 3600)
- *           ping:role subdomains:bool crawl:bool (false → only the start URL + extra pages; sets features.pages=false & maxPages=1)
- *           scope:string (path prefix, e.g. /docs) max_pages:int(1..1000)
- *           → parseWatchInput (reject invalid with an ephemeral error); reject duplicates in the guild (findWatchByUrl);
- *             store.createWatch; monitor.onWatchAdded is NOT enough — defer reply (ephemeral false), await monitor.runBaseline(id),
- *             then edit reply with a summary embed ("✅ Watching Unpeg (https://unpeg.io/) in #alerts — baseline: 12 pages, 2 files,
- *             5 subdomains, build `KU79…`, every 30s"), then monitor.onWatchAdded(watch). If the homepage was unreachable/blocked,
- *             say so in the summary (still keep the watch). If !config.dataDirPersistent add a warning line that data will be lost on
- *             redeploy (attach a Railway volume and set DATA_DIR).
- *   remove  site:string(req, autocomplete) → store.deleteWatch + monitor.onWatchRemoved.
- *   list    → embed listing guild watches: "#id **name** — url · every Ns · #channel · features · paused?" (ephemeral false).
- *   info    site(req, autocomplete) → embed: url, channel, interval/sweep, features on/off, pages tracked/known, files, subdomains,
- *           build id, last check (relative <t:unix:R>), last change, last error, runtime info.
- *   check   site(req, autocomplete) full:bool → defer, monitor.checkNow, reply with "No changes" or "Sent N alert(s)" (+ error).
- *   pause / resume  site(req, autocomplete) → updateWatch({paused}) + monitor.onWatchUpdated.
- *   set     site(req, autocomplete) + optional: name, channel, interval, sweep(int 30..86400), ping(role), clear_ping(bool),
- *           max_pages, scope (string; "/" or "none" clears), and feature booleans: deploy, text, pages, subdomains, files, status,
- *           code_intel, ignore_numbers → updateWatch + monitor.onWatchUpdated; reply with the changed settings.
- *   ignore  site(req, autocomplete) pattern:string(req, a regex) remove:bool → validate regex (new RegExp(p,'gi') in try/catch),
- *           add/remove in ignorePatterns, store.resetPageNoise(id), updateWatch, onWatchUpdated (triggers silent re-baseline).
- *   exclude site pattern remove → same for excludePatterns (URL regex).
- *   addpage site url(req) remove:bool → absolute URL (relative paths resolved against watch.url), must be http(s); add/remove extraUrls.
- *   pages   site(req, autocomplete) → ephemeral list of tracked pages (path · title), up to 40, plus counts (known/tracked/files/gone/dynamic).
- *   subdomains site(req, autocomplete) → ephemeral list of known subdomains (host · alive? · sources), up to 60.
- *   history site(req, autocomplete) limit:int(1..25, default 10) → events newest first with <t:unix:R>.
- *   help    → ephemeral embed explaining what the bot detects and the commands.
- * Autocomplete for `site`: guild watches filtered by the typed text (id/name/host), up to 25 choices, name "name — host", value = String(id).
- * Any lookup failure → ephemeral "Unknown site. Use /watch list." Errors → ephemeral "⚠️ <message>" (log the stack).
- * Guard: all handlers require interaction.inGuild(); re-check member has ManageGuild permission for mutating subcommands
- * (defense in depth even though default_member_permissions is set).
+ * Registered commands (default_member_permissions = ManageGuild, guild-only):
+ *   /panel  → post the Site Watcher dashboard in this channel (deps.panel.placePanel) and reply ephemerally with its link.
+ *             Everything else — pause/resume, settings, checks on/off, ignore/skip rules, extra pages, pages, subdomains,
+ *             history and site details — lives on the dashboard (buttons, selects and modals; see panel.ts).
+ *   /watch add     url(req) name channel interval ping → validate, reject duplicates / over-limit, create, defer (public),
+ *                  run the silent baseline (bounded by REPLY_DEADLINE_MS), edit the reply with a summary, then start the watch.
+ *   /watch remove  site(req, autocomplete) → store.deleteWatch + monitor.onWatchRemoved.
+ *   /watch check   site(req, autocomplete) full:bool → defer (ephemeral), monitor.checkNow, report.
+ *   /watch list    → public embed listing the server's watches.
+ *   /watch help    → ephemeral help.
+ * Autocomplete for `site`: guild watches filtered by id/name/host, ≤ 25 choices "name — host", value = String(id).
+ * Errors → ephemeral "⚠️ <message>" (stack logged unless it is a UserError). Mutating commands re-check Manage Server.
  *
- * Buttons: custom_id `watchsub:<watchId>:<host>` (from subdomain alerts) → requires ManageGuild; if a watch for https://<host>/
- * already exists in the guild → ephemeral "Already watching"; else create a watch for https://<host>/ in the same channel as the
- * parent watch, name "<parent name> (<first label>)", features = parent features but subdomains=false; runBaseline; onWatchAdded;
- * reply ephemeral "✅ Now watching <host>".
+ * Buttons: `watchsub:<watchId>:<host>` (from subdomain alerts) → watch that subdomain as its own site (Manage Server).
  *
  * Implementation notes:
- * - Duplicate checks and inserts happen synchronously (no await in between) BEFORE deferring, so a double-submitted command or a
- *   double-clicked button can never create two watches.
- * - Mutations reply publicly (an audit trail for the shared server); read-only views other than `list` are ephemeral.
- * - User-supplied regexes run against every page on every sweep, so patterns with nested quantifiers ("(a+)+") — the classic
- *   catastrophic-backtracking shape — and patterns that would blank out all text / exclude every URL are rejected.
- * - A second watch on a root domain that another watch already scans for subdomains gets subdomains off by default (they
- *   would be announced twice), is warned about duplicate redeploy/uptime alerts for the same host, and is named after its
- *   subdomain or first path segment ("Unpeg docs") rather than "Unpeg 2". A server can hold at most
- *   config.maxWatchesPerGuild watches.
- * - Replies never wait on a scan longer than the interaction token lives (15 min): after REPLY_DEADLINE_MS the reply says
- *   the scan is still running and the watch starts by itself when it finishes.
+ * - Duplicate checks and inserts happen synchronously (no await in between) BEFORE deferring, so a double-submitted command,
+ *   modal or double-clicked button can never create two watches.
+ * - User-supplied regexes run against every page on every sweep: nested quantifiers ("(a+)+") and patterns that are slow on
+ *   adversarial input are rejected, and so are patterns that would blank out all text / exclude every URL.
+ * - A second watch on a root domain whose subdomains another watch already scans gets subdomains off by default, is warned
+ *   about duplicate redeploy/uptime alerts for the same host, and is named after its subdomain or first path segment.
+ * - Replies never wait on a scan longer than the interaction token lives (15 min): after REPLY_DEADLINE_MS the reply says the
+ *   scan is still running and the watch starts by itself when it finishes.
  */
 
 import {
@@ -58,11 +33,15 @@ import {
   MessageFlags,
   PermissionFlagsBits,
   SlashCommandBuilder,
+  type APIActionRowComponent,
+  type APIComponentInMessageActionRow,
   type APIEmbed,
+  type APIEmbedField,
   type AutocompleteInteraction,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
   type RESTPostAPIChatInputApplicationCommandsJSONBody,
+  type RepliableInteraction,
   type SlashCommandStringOption,
 } from 'discord.js';
 import vm from 'node:vm';
@@ -70,18 +49,22 @@ import { parse as parseDomain } from 'tldts';
 import type { Config } from '../config.js';
 import type { Store } from '../db/store.js';
 import type { BaselineSummary, Monitor } from '../monitor/scheduler.js';
-import type { AlertKind, Logger, Watch, WatchFeatures, WatchPatch } from '../types.js';
+import type { AlertKind, Logger, Watch, WatchFeatures, WatchState } from '../types.js';
 import { isUnderDomain, normalizeUrl, parseWatchInput, urlPath } from '../extract/url.js';
 import { ALERT_COLORS, WATCH_SUB_PREFIX, clampEmbed, codeSpan, escapeMarkdown, formatDuration, truncate } from './format.js';
+import type { PanelHost } from './panel.js';
 
 export interface CommandDeps {
   store: Store;
   monitor: Monitor;
   config: Config;
   log: Logger;
+  /** Owner of the persistent dashboard message (null/absent until it is available). */
+  panel?: PanelHost | null;
 }
 
 export const COMMAND_NAME = 'watch';
+export const PANEL_COMMAND_NAME = 'panel';
 export const MAX_INTERVAL_SEC = 3600;
 export const SWEEP_MIN_SEC = 30;
 export const SWEEP_MAX_SEC = 86_400;
@@ -90,13 +73,15 @@ export const MAX_NAME_CHARS = 100;
 export const MAX_PATTERN_CHARS = 300;
 export const MAX_PATTERNS = 25;
 export const MAX_EXTRA_URLS = 50;
-const MAX_SCOPE_CHARS = 200;
+export const MAX_SCOPE_CHARS = 200;
 const PAGES_LISTED = 40;
 const SUBDOMAINS_LISTED = 60;
 const EPHEMERAL = MessageFlags.Ephemeral;
-const NO_MENTIONS = { parse: [] as never[] };
+export const NO_MENTIONS = { parse: [] as never[] };
 /** Interaction tokens expire after 15 minutes: reply before that even if a scan is still running. */
 export const REPLY_DEADLINE_MS = 13 * 60_000;
+/** Discord error codes meaning "the bot can't see / post in that channel". */
+const ACCESS_ERROR_CODES = new Set([10003, 50001, 50013]);
 
 /** Human labels for alert kinds in replies. */
 const KIND_LABEL: Record<AlertKind, string> = {
@@ -109,6 +94,18 @@ const KIND_LABEL: Record<AlertKind, string> = {
   file: 'files',
   status: 'uptime',
   info: 'notes',
+};
+
+const KIND_EMOJI: Record<AlertKind, string> = {
+  deploy: '🌐',
+  text: '📝',
+  new_pages: '🆕',
+  removed_pages: '🗑️',
+  subdomain: '🛰️',
+  subdomain_live: '🟣',
+  file: '📄',
+  status: '🚦',
+  info: 'ℹ️',
 };
 
 /** Resolves with the promise's value, or `{ done: false }` once `ms` passed first (the promise keeps running). */
@@ -134,32 +131,39 @@ export class UserError extends Error {
 }
 
 const UNKNOWN_SITE = 'Unknown site. Use /watch list.';
+export const NEED_MANAGE = 'You need the **Manage Server** permission to do that.';
 
 /** Subcommands that change state (or trigger network work) and so require Manage Server. */
-const PRIVILEGED = new Set(['add', 'remove', 'set', 'pause', 'resume', 'ignore', 'exclude', 'addpage', 'check']);
+const PRIVILEGED = new Set(['add', 'remove', 'check']);
 
-/** Feature flags in display order: [key, label, `/watch set` option name]. */
-const FEATURES: ReadonlyArray<readonly [keyof WatchFeatures, string, string]> = [
-  ['deploy', 'redeploys', 'deploy'],
-  ['text', 'text changes', 'text'],
-  ['pages', 'new/removed pages', 'pages'],
-  ['subdomains', 'subdomains', 'subdomains'],
-  ['files', 'files', 'files'],
-  ['status', 'uptime', 'status'],
-  ['codeIntel', 'code intel', 'code_intel'],
+/** Feature flags in display order: [key, label]. */
+const FEATURES: ReadonlyArray<readonly [keyof WatchFeatures, string]> = [
+  ['deploy', 'redeploys'],
+  ['text', 'text changes'],
+  ['pages', 'new/removed pages'],
+  ['subdomains', 'subdomains'],
+  ['files', 'files'],
+  ['status', 'uptime'],
+  ['codeIntel', 'code intel'],
 ];
 
-const KIND_EMOJI: Record<AlertKind, string> = {
-  deploy: '🌐',
-  text: '📝',
-  new_pages: '🆕',
-  removed_pages: '🗑️',
-  subdomain: '🛰️',
-  subdomain_live: '🟣',
-  file: '📄',
-  status: '🚦',
-  info: 'ℹ️',
-};
+export type ToggleKey = keyof WatchFeatures | 'maskNumbers';
+
+/** Every on/off switch of a watch (the dashboard's 🧩 Features view), in display order. */
+export const FEATURE_TOGGLES: ReadonlyArray<{ key: ToggleKey; label: string; emoji: string; hint: string }> = [
+  { key: 'deploy', label: 'Redeploys', emoji: '🌐', hint: 'new JS/CSS bundles or build id' },
+  { key: 'text', label: 'Text changes', emoji: '📝', hint: 'visible text on tracked pages, with a diff' },
+  { key: 'pages', label: 'New pages', emoji: '🆕', hint: 'pages added or removed (links, sitemap, code)' },
+  { key: 'subdomains', label: 'Subdomains', emoji: '🛰️', hint: 'new subdomains (certificate logs, DNS, code)' },
+  { key: 'files', label: 'Files', emoji: '📄', hint: 'linked PDFs, docs, markdown…' },
+  { key: 'status', label: 'Uptime', emoji: '🚦', hint: 'site goes down / comes back up' },
+  { key: 'codeIntel', label: 'Code intel', emoji: '🔎', hint: 'new routes and hosts in freshly deployed code' },
+  { key: 'maskNumbers', label: 'Ignore numbers', emoji: '🔢', hint: 'ignore changes that only touch numbers' },
+];
+
+export function toggleValue(w: Watch, key: ToggleKey): boolean {
+  return key === 'maskNumbers' ? w.maskNumbers : Boolean(w.features[key]);
+}
 
 // ---------------------------------------------------------------------------
 // Command definitions
@@ -170,17 +174,23 @@ function clampInt(v: unknown, min: number, max: number, fallback: number): numbe
   return Math.min(max, Math.max(min, n));
 }
 
-function minInterval(config: Pick<Config, 'minIntervalSec'>): number {
+/** Smallest allowed check interval (config.minIntervalSec, kept within 1..MAX_INTERVAL_SEC). */
+export function minInterval(config: Pick<Config, 'minIntervalSec'>): number {
   return clampInt(config?.minIntervalSec, 1, MAX_INTERVAL_SEC, 10);
+}
+
+/** Check interval of a new watch when none is given. */
+export function defaultInterval(config: Pick<Config, 'minIntervalSec' | 'defaultIntervalSec'>): number {
+  return Math.min(MAX_INTERVAL_SEC, Math.max(clampInt(config?.defaultIntervalSec, 1, MAX_INTERVAL_SEC, 30), minInterval(config)));
 }
 
 const siteOption = (o: SlashCommandStringOption) =>
   o.setName('site').setDescription('Watched site (pick from the list, or type its name, id or URL)').setRequired(true).setAutocomplete(true).setMaxLength(200);
 
-/** JSON bodies for command registration (currently just `/watch`). */
+/** JSON bodies for command registration: `/watch` and `/panel`. */
 export function commandDefinitions(config: Pick<Config, 'minIntervalSec'>): RESTPostAPIChatInputApplicationCommandsJSONBody[] {
   const minInt = minInterval(config);
-  const cmd = new SlashCommandBuilder()
+  const watch = new SlashCommandBuilder()
     .setName(COMMAND_NAME)
     .setDescription('Watch websites for redeploys, text changes, new pages, subdomains and downtime')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
@@ -198,15 +208,9 @@ export function commandDefinitions(config: Pick<Config, 'minIntervalSec'>): REST
         .addIntegerOption((o) =>
           o.setName('interval').setDescription(`Seconds between homepage checks (${minInt}-${MAX_INTERVAL_SEC})`).setMinValue(minInt).setMaxValue(MAX_INTERVAL_SEC),
         )
-        .addRoleOption((o) => o.setName('ping').setDescription('Role to ping on alerts'))
-        .addBooleanOption((o) => o.setName('subdomains').setDescription('Detect new subdomains (default: on)'))
-        .addBooleanOption((o) => o.setName('crawl').setDescription('Crawl the site for pages (off = only the start URL and added pages)'))
-        .addStringOption((o) => o.setName('scope').setDescription('Only crawl paths under this prefix, e.g. /docs').setMaxLength(MAX_SCOPE_CHARS))
-        .addIntegerOption((o) => o.setName('max_pages').setDescription(`Max pages whose text is tracked (1-${MAX_PAGES_LIMIT})`).setMinValue(1).setMaxValue(MAX_PAGES_LIMIT)),
+        .addRoleOption((o) => o.setName('ping').setDescription('Role to ping on alerts')),
     )
     .addSubcommand((s) => s.setName('remove').setDescription('Stop watching a site').addStringOption(siteOption))
-    .addSubcommand((s) => s.setName('list').setDescription('List watched sites in this server'))
-    .addSubcommand((s) => s.setName('info').setDescription('Show settings and status of a watched site').addStringOption(siteOption))
     .addSubcommand((s) =>
       s
         .setName('check')
@@ -214,103 +218,57 @@ export function commandDefinitions(config: Pick<Config, 'minIntervalSec'>): REST
         .addStringOption(siteOption)
         .addBooleanOption((o) => o.setName('full').setDescription('Re-check every tracked page, not just the homepage')),
     )
-    .addSubcommand((s) => s.setName('pause').setDescription('Pause checks for a site').addStringOption(siteOption))
-    .addSubcommand((s) => s.setName('resume').setDescription('Resume checks for a paused site').addStringOption(siteOption))
-    .addSubcommand((s) =>
-      s
-        .setName('set')
-        .setDescription('Change settings of a watched site')
-        .addStringOption(siteOption)
-        .addStringOption((o) => o.setName('name').setDescription('New display name').setMaxLength(MAX_NAME_CHARS))
-        .addChannelOption((o) =>
-          o.setName('channel').setDescription('Channel for alerts').addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement),
-        )
-        .addIntegerOption((o) =>
-          o.setName('interval').setDescription(`Seconds between homepage checks (${minInt}-${MAX_INTERVAL_SEC})`).setMinValue(minInt).setMaxValue(MAX_INTERVAL_SEC),
-        )
-        .addIntegerOption((o) =>
-          o.setName('sweep').setDescription(`Seconds to re-check every tracked page once (${SWEEP_MIN_SEC}-${SWEEP_MAX_SEC})`).setMinValue(SWEEP_MIN_SEC).setMaxValue(SWEEP_MAX_SEC),
-        )
-        .addRoleOption((o) => o.setName('ping').setDescription('Role to ping on alerts'))
-        .addBooleanOption((o) => o.setName('clear_ping').setDescription('Stop pinging a role'))
-        .addIntegerOption((o) => o.setName('max_pages').setDescription(`Max pages whose text is tracked (1-${MAX_PAGES_LIMIT})`).setMinValue(1).setMaxValue(MAX_PAGES_LIMIT))
-        .addStringOption((o) => o.setName('scope').setDescription('Only crawl under this path prefix; "/" or "none" = whole site').setMaxLength(MAX_SCOPE_CHARS))
-        .addBooleanOption((o) => o.setName('deploy').setDescription('Detect redeploys (JS/CSS bundles, build id)'))
-        .addBooleanOption((o) => o.setName('text').setDescription('Detect visible text changes'))
-        .addBooleanOption((o) => o.setName('pages').setDescription('Detect new and removed pages'))
-        .addBooleanOption((o) => o.setName('subdomains').setDescription('Detect new subdomains'))
-        .addBooleanOption((o) => o.setName('files').setDescription('Detect changes to linked files (pdf, md, ...)'))
-        .addBooleanOption((o) => o.setName('status').setDescription('Alert when the site goes down / comes back up'))
-        .addBooleanOption((o) => o.setName('code_intel').setDescription('On redeploy, scan new JS for new routes and hosts'))
-        .addBooleanOption((o) => o.setName('ignore_numbers').setDescription('Ignore changes that only touch numbers (prices, counters)')),
-    )
-    .addSubcommand((s) =>
-      s
-        .setName('ignore')
-        .setDescription('Ignore text matching a regex when comparing pages')
-        .addStringOption(siteOption)
-        .addStringOption((o) => o.setName('pattern').setDescription('JavaScript regex (case-insensitive), e.g. Last updated.*').setRequired(true).setMaxLength(MAX_PATTERN_CHARS))
-        .addBooleanOption((o) => o.setName('remove').setDescription('Remove this pattern instead of adding it')),
-    )
-    .addSubcommand((s) =>
-      s
-        .setName('exclude')
-        .setDescription('Never crawl or track URLs matching a regex')
-        .addStringOption(siteOption)
-        .addStringOption((o) => o.setName('pattern').setDescription('JavaScript regex matched against full URLs, e.g. /blog/').setRequired(true).setMaxLength(MAX_PATTERN_CHARS))
-        .addBooleanOption((o) => o.setName('remove').setDescription('Remove this pattern instead of adding it')),
-    )
-    .addSubcommand((s) =>
-      s
-        .setName('addpage')
-        .setDescription('Always track an extra page or file (e.g. an unlinked page)')
-        .addStringOption(siteOption)
-        .addStringOption((o) => o.setName('url').setDescription('Absolute URL or a path like /docs/secret').setRequired(true).setMaxLength(2000))
-        .addBooleanOption((o) => o.setName('remove').setDescription('Stop tracking this extra page')),
-    )
-    .addSubcommand((s) => s.setName('pages').setDescription('List tracked pages of a site').addStringOption(siteOption))
-    .addSubcommand((s) => s.setName('subdomains').setDescription('List known subdomains of a site').addStringOption(siteOption))
-    .addSubcommand((s) =>
-      s
-        .setName('history')
-        .setDescription('Recent alerts for a site')
-        .addStringOption(siteOption)
-        .addIntegerOption((o) => o.setName('limit').setDescription('How many (1-25, default 10)').setMinValue(1).setMaxValue(25)),
-    )
+    .addSubcommand((s) => s.setName('list').setDescription('List watched sites in this server'))
     .addSubcommand((s) => s.setName('help').setDescription('What this bot detects and how to use it'));
-  return [cmd.toJSON()];
+  const panel = new SlashCommandBuilder()
+    .setName(PANEL_COMMAND_NAME)
+    .setDescription('Post the Site Watcher dashboard in this channel')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setContexts(InteractionContextType.Guild)
+    .setDMPermission(false);
+  return [watch.toJSON(), panel.toJSON()];
 }
 
 // ---------------------------------------------------------------------------
-// Shared helpers
+// Shared helpers (also used by the dashboard)
 // ---------------------------------------------------------------------------
 
-type Repliable = ChatInputCommandInteraction | ButtonInteraction;
-type Body = { content?: string; embeds?: APIEmbed[] };
+export type Repliable = RepliableInteraction;
+export type ActionRow = APIActionRowComponent<APIComponentInMessageActionRow>;
+export interface Body {
+  content?: string;
+  embeds?: APIEmbed[];
+  components?: ActionRow[];
+}
 
-function errMessage(err: unknown): string {
+export function errMessage(err: unknown): string {
   if (err instanceof Error) return err.message || err.name;
   return String(err);
 }
 
+function errorCode(err: unknown): unknown {
+  return (err as { code?: unknown } | null)?.code;
+}
+
 /** Send (or update) the interaction response; never throws (the interaction may have expired). */
-async function respond(i: Repliable, body: Body, ephemeral: boolean, log: Logger): Promise<void> {
+export async function respond(i: Repliable, body: Body, ephemeral: boolean, log: Logger): Promise<void> {
   const embeds = body.embeds?.map(clampEmbed);
   const content = body.content !== undefined ? truncate(body.content, 2000) : undefined;
+  const components = body.components;
   try {
     if (i.deferred) {
-      await i.editReply({ content: content ?? '', embeds: embeds ?? [], allowedMentions: NO_MENTIONS });
+      await i.editReply({ content: content ?? '', embeds: embeds ?? [], components: components ?? [], allowedMentions: NO_MENTIONS });
     } else if (i.replied) {
-      await i.followUp({ content, embeds, allowedMentions: NO_MENTIONS, ...(ephemeral ? { flags: EPHEMERAL } : {}) });
+      await i.followUp({ content, embeds, components, allowedMentions: NO_MENTIONS, ...(ephemeral ? { flags: EPHEMERAL } : {}) });
     } else {
-      await i.reply({ content, embeds, allowedMentions: NO_MENTIONS, ...(ephemeral ? { flags: EPHEMERAL } : {}) });
+      await i.reply({ content, embeds, components, allowedMentions: NO_MENTIONS, ...(ephemeral ? { flags: EPHEMERAL } : {}) });
     }
   } catch (err) {
     log.warn('failed to respond to interaction', { err: errMessage(err) });
   }
 }
 
-async function defer(i: Repliable, ephemeral: boolean, log: Logger): Promise<void> {
+export async function defer(i: Repliable, ephemeral: boolean, log: Logger): Promise<void> {
   if (i.deferred || i.replied) return;
   try {
     await i.deferReply(ephemeral ? { flags: EPHEMERAL } : {});
@@ -319,12 +277,12 @@ async function defer(i: Repliable, ephemeral: boolean, log: Logger): Promise<voi
   }
 }
 
-async function replyError(i: Repliable, err: unknown, log: Logger, what: string): Promise<void> {
+export async function replyError(i: Repliable, err: unknown, log: Logger, what: string): Promise<void> {
   if (!(err instanceof UserError)) log.error(`${what} failed`, { err: err instanceof Error ? err : String(err) });
   await respond(i, { content: `⚠️ ${truncate(errMessage(err), 1900)}` }, true, log);
 }
 
-function hasManageGuild(i: Repliable): boolean {
+export function hasManageGuild(i: Pick<Repliable, 'memberPermissions'>): boolean {
   try {
     return Boolean(i.memberPermissions?.has(PermissionFlagsBits.ManageGuild));
   } catch {
@@ -332,11 +290,16 @@ function hasManageGuild(i: Repliable): boolean {
   }
 }
 
-function channelMention(id: string): string {
+/** Throws a friendly UserError unless the member has Manage Server. */
+export function requireManageGuild(i: Pick<Repliable, 'memberPermissions'>): void {
+  if (!hasManageGuild(i)) throw new UserError(NEED_MANAGE);
+}
+
+export function channelMention(id: string): string {
   return /^\d{5,25}$/.test(id) ? `<#${id}>` : `\`${id}\``;
 }
 
-function roleMention(id: string | null, guildId: string): string {
+export function roleMention(id: string | null, guildId: string): string {
   if (!id) return 'none';
   return id === guildId ? '@everyone' : `<@&${id}>`;
 }
@@ -345,22 +308,23 @@ function unix(ms: number): number {
   return Math.floor(ms / 1000);
 }
 
-function when(ms: number | null | undefined): string {
+export function when(ms: number | null | undefined): string {
   return typeof ms === 'number' && ms > 0 ? `<t:${unix(ms)}:R>` : 'never';
 }
 
-function nameOf(w: Watch): string {
-  return escapeMarkdown(truncate(w.name.replace(/[\r\n]+/g, ' '), MAX_NAME_CHARS));
+/** Escaped single-line display name. */
+export function nameOf(w: Pick<Watch, 'name'>, max = MAX_NAME_CHARS): string {
+  return escapeMarkdown(truncate(w.name.replace(/[\r\n]+/g, ' '), max));
 }
 
-function featureSummary(f: WatchFeatures): string {
+export function featureSummary(f: WatchFeatures): string {
   const on = FEATURES.filter(([k]) => f[k]).map(([, label]) => label);
   if (on.length === FEATURES.length) return 'all checks';
   return on.length ? on.join(', ') : 'nothing (all checks off)';
 }
 
 /** Newline-joined lines within `budget` chars and `max` items; overflow becomes "…and N more". */
-function linesWithin(lines: string[], max: number, budget: number, more = (n: number) => `…and ${n} more`): string {
+export function linesWithin(lines: string[], max: number, budget: number, more = (n: number) => `…and ${n} more`): string {
   const out: string[] = [];
   let used = 0;
   for (const line of lines) {
@@ -382,15 +346,8 @@ function resolveSite(i: ChatInputCommandInteraction, deps: CommandDeps, guildId:
   return w;
 }
 
-function intOption(i: ChatInputCommandInteraction, name: string, min: number, max: number, unit = ''): number | null {
-  const v = i.options.getInteger(name);
-  if (v === null || v === undefined) return null;
-  if (!Number.isInteger(v) || v < min || v > max) throw new UserError(`\`${name}\` must be between ${min} and ${max}${unit}.`);
-  return v;
-}
-
 /** Trimmed single-line display name; rejects empty and number-only names (those would be read as watch ids). */
-function cleanName(raw: string | null): string | null {
+export function cleanName(raw: string | null | undefined): string | null {
   if (raw === null || raw === undefined) return null;
   const name = raw.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
   if (!name) throw new UserError('The name cannot be empty.');
@@ -399,7 +356,7 @@ function cleanName(raw: string | null): string | null {
   return name;
 }
 
-function nameTaken(deps: CommandDeps, guildId: string, name: string, exceptId?: number): boolean {
+export function nameTaken(deps: Pick<CommandDeps, 'store'>, guildId: string, name: string, exceptId?: number): boolean {
   const lower = name.toLowerCase();
   return deps.store.listWatches(guildId).some((w) => w.id !== exceptId && w.name.trim().toLowerCase() === lower);
 }
@@ -415,9 +372,9 @@ function uniqueName(deps: CommandDeps, guildId: string, base: string): string {
 }
 
 /**
- * Path-prefix scope: undefined = option not given, null = whole site. Accepts "/docs", "docs/", or a full URL (its path is used).
+ * Path-prefix scope: undefined = not given, null = whole site. Accepts "/docs", "docs/", or a full URL (its path is used).
  */
-export function parseScope(raw: string | null): string | null | undefined {
+export function parseScope(raw: string | null | undefined): string | null | undefined {
   if (raw === null || raw === undefined) return undefined;
   let v = raw.trim();
   if (!v || v === '/' || /^(none|off|all)$/i.test(v)) return null;
@@ -524,7 +481,11 @@ export function regexIsFast(source: string, flags: string, timeoutMs = REGEX_PRO
   }
 }
 
-function validatePattern(pattern: string, kind: 'ignore' | 'exclude'): string {
+/**
+ * Validate an ignore (text) or exclude (URL) regex: syntax, ReDoS shape, speed on adversarial input, and not so broad that it
+ * would blank out all text / exclude every URL. Returns the trimmed pattern.
+ */
+export function validatePattern(pattern: string, kind: 'ignore' | 'exclude'): string {
   const p = pattern.trim();
   if (!p) throw new UserError('The pattern cannot be empty.');
   if (p.length > MAX_PATTERN_CHARS) throw new UserError(`The pattern is too long (max ${MAX_PATTERN_CHARS} characters).`);
@@ -553,8 +514,8 @@ function validatePattern(pattern: string, kind: 'ignore' | 'exclude'): string {
 }
 
 /**
- * Resolve an `addpage` URL: absolute http(s) URLs as-is, "unpeg.io/x"-style inputs whose host is (under) the watched domain or a
- * real public domain followed by a path, anything else relative to the watch URL. Returns a normalized URL or null.
+ * Resolve an extra-page URL: absolute http(s) URLs as-is, "unpeg.io/x"-style inputs whose host is (under) the watched domain or
+ * a real public domain followed by a path, anything else relative to the watch URL. Returns a normalized URL or null.
  */
 export function resolvePageUrl(raw: string, watch: Pick<Watch, 'url' | 'host' | 'rootDomain'>): string | null {
   let s = raw.trim();
@@ -584,7 +545,7 @@ export function resolvePageUrl(raw: string, watch: Pick<Watch, 'url' | 'host' | 
 }
 
 /** Missing bot permissions in a channel (best effort: empty when it can't be determined). */
-function missingChannelPerms(i: Repliable, channelId: string): string[] {
+function missingChannelPerms(i: Pick<Repliable, 'guild'>, channelId: string): string[] {
   try {
     const guild = i.guild;
     const me = guild?.members?.me;
@@ -606,10 +567,12 @@ function missingChannelPerms(i: Repliable, channelId: string): string[] {
   }
 }
 
-function permsWarning(i: Repliable, channelId: string): string | null {
+/** A warning line when the bot can't deliver alerts to `channelId`, else null. */
+export function permsWarning(i: Pick<Repliable, 'guild'> | undefined, channelId: string): string | null {
+  if (!i) return null;
   const missing = missingChannelPerms(i, channelId);
   if (missing.includes('channel not found')) {
-    return `⚠️ The alert channel ${channelMention(channelId)} no longer exists — alerts can't be delivered. Pick another one with \`/watch set channel:\`.`;
+    return `⚠️ The alert channel ${channelMention(channelId)} no longer exists — alerts can't be delivered. Pick another one under ⚙️ Settings on the dashboard.`;
   }
   return missing.length
     ? `⚠️ I'm missing **${missing.join(', ')}** in ${channelMention(channelId)} — alerts can't be delivered until that's fixed.`
@@ -681,7 +644,8 @@ async function baselineAndStart(deps: CommandDeps, watch: Watch): Promise<{ summ
   }
 }
 
-function startWatch(deps: CommandDeps, watchId: number): Watch | undefined {
+/** Hand a stored watch to the monitor (after its first scan). Returns the fresh row, or undefined if it was deleted. */
+export function startWatch(deps: CommandDeps, watchId: number): Watch | undefined {
   const fresh = deps.store.getWatch(watchId);
   if (!fresh) return undefined;
   try {
@@ -692,7 +656,8 @@ function startWatch(deps: CommandDeps, watchId: number): Watch | undefined {
   return fresh;
 }
 
-function notifyUpdated(deps: CommandDeps, watch: Watch): void {
+/** Tell the monitor a watch changed (never throws). */
+export function notifyUpdated(deps: CommandDeps, watch: Watch): void {
   try {
     deps.monitor.onWatchUpdated(watch);
   } catch (err) {
@@ -700,21 +665,26 @@ function notifyUpdated(deps: CommandDeps, watch: Watch): void {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Subcommands
-// ---------------------------------------------------------------------------
-
-interface Ctx {
-  i: ChatInputCommandInteraction;
-  deps: CommandDeps;
-  guildId: string;
+/** Delete a watch and stop its loops. */
+export function removeWatch(deps: CommandDeps, w: Watch, by: string): void {
+  deps.store.deleteWatch(w.id);
+  try {
+    deps.monitor.onWatchRemoved(w.id);
+  } catch (err) {
+    deps.log.error('monitor.onWatchRemoved failed', { watchId: w.id, err: err instanceof Error ? err : String(err) });
+  }
+  deps.log.info('watch removed', { watchId: w.id, url: w.url, by });
 }
+
+// ---------------------------------------------------------------------------
+// Add flow (shared by /watch add and the dashboard's Add site modal)
+// ---------------------------------------------------------------------------
 
 /** Throws when the server already holds the maximum number of watches. */
 function checkWatchLimit(deps: CommandDeps, guildId: string): void {
   const max = deps.config.maxWatchesPerGuild;
   if (typeof max === 'number' && max > 0 && deps.store.listWatches(guildId).length >= max) {
-    throw new UserError(`This server already watches ${max} sites (the limit). Remove one with \`/watch remove\` first.`);
+    throw new UserError(`This server already watches ${max} sites (the limit). Remove one first.`);
   }
 }
 
@@ -722,7 +692,7 @@ function checkWatchLimit(deps: CommandDeps, guildId: string): void {
  * A default name that tells a second watch of the same site apart: "Unpeg docs" for docs.unpeg.io or unpeg.io/docs,
  * instead of "Unpeg 2".
  */
-function distinctName(deps: CommandDeps, guildId: string, parsed: { suggestedName: string; host: string; rootDomain: string; url: string }): string {
+export function distinctName(deps: CommandDeps, guildId: string, parsed: { suggestedName: string; host: string; rootDomain: string; url: string }): string {
   const base = parsed.suggestedName;
   if (!nameTaken(deps, guildId, base)) return base;
   let label = '';
@@ -740,13 +710,39 @@ function distinctName(deps: CommandDeps, guildId: string, parsed: { suggestedNam
   return uniqueName(deps, guildId, base);
 }
 
-async function cmdAdd({ i, deps, guildId }: Ctx): Promise<void> {
+export interface AddRequest {
+  guildId: string;
+  /** Alert channel. */
+  channelId: string;
+  userId: string;
+  url: string;
+  name?: string | null;
+  intervalSec?: number | null;
+  pingRoleId?: string | null;
+  subdomains?: boolean | null;
+  /** false → only the start URL and extra pages (features.pages off, maxPages 1). */
+  crawl?: boolean | null;
+  scope?: string | null;
+  maxPages?: number | null;
+}
+
+export interface PreparedAdd {
+  watch: Watch;
+  /** Notes for the summary (overlap with other watches of the same site). */
+  notes: string[];
+}
+
+/**
+ * Validate an add request and store the watch — synchronously, so two submissions can't both pass the duplicate check.
+ * Throws UserError on bad input, duplicates or the per-server limit.
+ */
+export function prepareAdd(deps: CommandDeps, req: AddRequest): PreparedAdd {
   const { store, config, log } = deps;
-  const rawUrl = i.options.getString('url', true);
-  const parsed = parseWatchInput(rawUrl);
+  const { guildId } = req;
+  const parsed = parseWatchInput(req.url);
   if (!parsed) {
     throw new UserError(
-      `${codeSpan(rawUrl, 100)} doesn't look like a website URL. Try something like \`unpeg.io\` or \`https://unpeg.io/docs\`.`,
+      `${codeSpan(req.url, 100)} doesn't look like a website URL. Try something like \`unpeg.io\` or \`https://unpeg.io/docs\`.`,
     );
   }
   // Scheme-less lookup: http:// and https:// versions of one URL are the same site.
@@ -754,78 +750,85 @@ async function cmdAdd({ i, deps, guildId }: Ctx): Promise<void> {
   if (existing) throw new UserError(`Already watching ${existing.url} as **#${existing.id} ${nameOf(existing)}**.`);
   checkWatchLimit(deps, guildId);
 
-  const explicitName = cleanName(i.options.getString('name'));
+  const explicitName = cleanName(req.name ?? null);
   if (explicitName && nameTaken(deps, guildId, explicitName)) {
     throw new UserError(`A site named **${escapeMarkdown(explicitName)}** already exists. Pick another name.`);
   }
+  const minInt = minInterval(config);
+  const interval = req.intervalSec ?? null;
+  if (interval !== null && (!Number.isInteger(interval) || interval < minInt || interval > MAX_INTERVAL_SEC)) {
+    throw new UserError(`The check interval must be between ${minInt} and ${MAX_INTERVAL_SEC} seconds.`);
+  }
+  const maxPages = req.maxPages ?? null;
+  if (maxPages !== null && (!Number.isInteger(maxPages) || maxPages < 1 || maxPages > MAX_PAGES_LIMIT)) {
+    throw new UserError(`Max pages must be between 1 and ${MAX_PAGES_LIMIT}.`);
+  }
+  const scopePath = parseScope(req.scope ?? null) ?? null;
   const name = explicitName ?? distinctName(deps, guildId, parsed);
-  const channelId = i.options.getChannel('channel')?.id ?? i.channelId;
-  const interval = intOption(i, 'interval', minInterval(config), MAX_INTERVAL_SEC, 's');
-  const maxPages = intOption(i, 'max_pages', 1, MAX_PAGES_LIMIT);
-  const pingRoleId = i.options.getRole('ping')?.id ?? null;
-  const subdomains = i.options.getBoolean('subdomains');
-  const crawl = i.options.getBoolean('crawl');
-  const scopePath = parseScope(i.options.getString('scope')) ?? null;
 
   const features: Partial<WatchFeatures> = {};
-  if (subdomains !== null && subdomains !== undefined) features.subdomains = subdomains;
-  if (crawl === false) features.pages = false;
+  const subdomains = req.subdomains ?? null;
+  if (subdomains !== null) features.subdomains = subdomains;
+  if (req.crawl === false) features.pages = false;
 
   // Other watches of the same site: subdomains would be announced twice, and the same host's redeploys/outages too.
   const siblings = store.listWatches(guildId).filter((w) => w.rootDomain === parsed.rootDomain);
   const notes: string[] = [];
   const subdomainOwner = siblings.find((w) => w.features.subdomains);
-  if ((subdomains === null || subdomains === undefined) && subdomainOwner) {
+  if (subdomains === null && subdomainOwner) {
     features.subdomains = false;
     notes.push(
-      `Subdomains of ${escapeMarkdown(parsed.rootDomain)} are already tracked by **#${subdomainOwner.id} ${nameOf(subdomainOwner)}** — off here (pass \`subdomains:true\` to override).`,
+      `Subdomains of ${escapeMarkdown(parsed.rootDomain)} are already tracked by **#${subdomainOwner.id} ${nameOf(subdomainOwner)}** — off here (turn them on under 🧩 Features on the dashboard to override).`,
     );
   }
   const sameHost = siblings.find((w) => w.host === parsed.host);
   if (sameHost) {
     notes.push(
-      `Redeploy and uptime alerts for ${escapeMarkdown(parsed.host)} already come from **#${sameHost.id} ${nameOf(sameHost)}** — use \`/watch set deploy:false status:false\` on one of them to avoid duplicates${
+      `Redeploy and uptime alerts for ${escapeMarkdown(parsed.host)} already come from **#${sameHost.id} ${nameOf(sameHost)}** — turn **Redeploys** and **Uptime** off under 🧩 Features on one of them to avoid duplicates${
         sameHost.scopePath ? '' : ', and note that its crawl already covers the whole host unless it is scoped'
       }.`,
     );
   }
 
-  const created = store.createWatch({
+  const watch = store.createWatch({
     guildId,
-    channelId,
+    channelId: req.channelId,
     name,
     url: parsed.url,
     host: parsed.host,
     rootDomain: parsed.rootDomain,
-    createdBy: i.user.id,
-    intervalSec: interval ?? Math.max(config.defaultIntervalSec, minInterval(config)),
-    maxPages: crawl === false ? 1 : (maxPages ?? undefined),
-    pingRoleId,
+    createdBy: req.userId,
+    intervalSec: interval ?? defaultInterval(config),
+    maxPages: req.crawl === false ? 1 : (maxPages ?? undefined),
+    pingRoleId: req.pingRoleId ?? null,
     features,
     scopePath,
   });
-  log.info('watch added', { watchId: created.id, url: created.url, guild: guildId, by: i.user.id });
+  log.info('watch added', { watchId: watch.id, url: watch.url, guild: guildId, by: req.userId });
+  return { watch, notes };
+}
 
-  await defer(i, false, log);
+/**
+ * Run the first (silent) scan of a prepared watch — never longer than the interaction token lives — and send the summary via
+ * `send` (which must not throw), then start the watch. `i` is used for channel-permission warnings.
+ */
+export async function finishAdd(deps: CommandDeps, prepared: PreparedAdd, send: (body: Body) => Promise<void>, i?: Pick<Repliable, 'guild'>): Promise<void> {
+  const { store, config } = deps;
+  const created = prepared.watch;
   const scan = baselineAndStart(deps, created);
   const timely = await withDeadline(scan, REPLY_DEADLINE_MS);
   if (!timely.done) {
     // The interaction token would expire: say so now; the watch starts by itself once its first scan finishes.
     void scan.then(() => startWatch(deps, created.id));
-    await respond(
-      i,
-      {
-        content: `⏳ Still scanning **${nameOf(created)}** (${created.url}) — the watch is saved and starts when the first scan finishes; see \`/watch info\`.`,
-      },
-      false,
-      log,
-    );
+    await send({
+      content: `⏳ Still scanning **${nameOf(created)}** (${created.url}) — the watch is saved and starts when the first scan finishes; follow it on the dashboard.`,
+    });
     return;
   }
   const { summary, error } = timely.value;
   const watch = store.getWatch(created.id);
   if (!watch) {
-    await respond(i, { content: `⚠️ **${nameOf(created)}** was removed while its first scan was running.` }, false, log);
+    await send({ content: `⚠️ **${nameOf(created)}** was removed while its first scan was running.` });
     return;
   }
 
@@ -833,175 +836,42 @@ async function cmdAdd({ i, deps, guildId }: Ctx): Promise<void> {
     `${watch.url} in ${channelMention(watch.channelId)} — every ${watch.intervalSec}s.`,
     ...baselineLines(watch, summary, error),
     `Detecting: ${featureSummary(watch.features)}.`,
-    ...notes,
+    ...prepared.notes,
   ];
   if (watch.scopePath) lines.push(`Scope: ${codeSpan(watch.scopePath, 200)}`);
-  if (watch.pingRoleId) lines.push(`Pinging ${roleMention(watch.pingRoleId, guildId)} on alerts.`);
+  if (watch.pingRoleId) lines.push(`Pinging ${roleMention(watch.pingRoleId, watch.guildId)} on alerts.`);
   const perms = permsWarning(i, watch.channelId);
   if (perms) lines.push(perms);
   const storage = storageWarning(config);
   if (storage) lines.push(storage);
   try {
-    await respond(
-      i,
-      {
-        embeds: [
-          {
-            title: `✅ Watching ${nameOf(watch)}`,
-            url: watch.url,
-            color: ALERT_COLORS.new_pages,
-            description: lines.join('\n'),
-            footer: { text: `#${watch.id} · ${watch.host}` },
-          },
-        ],
-      },
-      false,
-      log,
-    );
+    await send({
+      embeds: [
+        {
+          title: `✅ Watching ${nameOf(watch)}`,
+          url: watch.url,
+          color: ALERT_COLORS.new_pages,
+          description: lines.join('\n'),
+          footer: { text: `#${watch.id} · ${watch.host}` },
+        },
+      ],
+    });
   } finally {
     startWatch(deps, watch.id);
   }
 }
 
-async function cmdRemove({ i, deps, guildId }: Ctx): Promise<void> {
-  const w = resolveSite(i, deps, guildId);
-  deps.store.deleteWatch(w.id);
-  try {
-    deps.monitor.onWatchRemoved(w.id);
-  } catch (err) {
-    deps.log.error('monitor.onWatchRemoved failed', { watchId: w.id, err: err instanceof Error ? err : String(err) });
-  }
-  deps.log.info('watch removed', { watchId: w.id, url: w.url, by: i.user.id });
-  await respond(i, { content: `🗑️ Stopped watching **${nameOf(w)}** (<${w.url}>).` }, false, deps.log);
-}
+// ---------------------------------------------------------------------------
+// Check (shared by /watch check and the dashboard's ⚡ Check now)
+// ---------------------------------------------------------------------------
 
-async function cmdList({ i, deps, guildId }: Ctx): Promise<void> {
-  const watches = deps.store.listWatches(guildId);
-  if (!watches.length) {
-    await respond(i, { content: 'No sites are watched in this server yet. Add one with `/watch add url:unpeg.io`.' }, false, deps.log);
-    return;
-  }
-  const lines = watches.map(
-    (w) =>
-      `**#${w.id} ${nameOf(w)}** — ${truncate(w.url, 300)} · every ${w.intervalSec}s · ${channelMention(w.channelId)}${
-        missingChannelPerms(i, w.channelId).length ? ' ⚠️' : ''
-      } · ${featureSummary(w.features)}${w.paused ? ' · ⏸️ paused' : ''}`,
-  );
-  await respond(
-    i,
-    {
-      embeds: [
-        {
-          title: `Watched sites (${watches.length})`,
-          color: ALERT_COLORS.info,
-          description: linesWithin(lines, 100, 4000, (n) => `…and ${n} more — use \`/watch info\` for details.`),
-        },
-      ],
-    },
-    false,
-    deps.log,
-  );
-}
-
-function patternList(patterns: string[], empty = 'none'): string {
-  return patterns.length ? linesWithin(patterns.map((p) => codeSpan(p, 200)), 25, 1024) : empty;
-}
-
-async function cmdInfo({ i, deps, guildId }: Ctx): Promise<void> {
-  const { store } = deps;
-  const w = resolveSite(i, deps, guildId);
-  const state = store.getState(w.id);
-  const tracked = store.listPages(w.id, { kind: 'page', tracked: true });
-  const knownPages = store.countPages(w.id, { kind: 'page' });
-  const files = store.countPages(w.id, { kind: 'file' });
-  const subs = store.listSubdomains(w.id);
-  const alive = subs.filter((s) => s.alive).length;
-  const gone = tracked.filter((p) => p.gone).length;
-  const dynamic = tracked.filter((p) => p.dynamic).length;
-
-  let runtime = 'unknown';
-  try {
-    const rt = deps.monitor.runtimeInfo(w.id);
-    const parts = [rt.running ? 'running' : 'stopped'];
-    if (rt.baselineRunning) parts.push('baseline scan in progress');
-    if (typeof rt.lastTickMs === 'number') {
-      parts.push(`last check took ${rt.lastTickMs < 1000 ? `${Math.round(rt.lastTickMs)}ms` : formatDuration(rt.lastTickMs)}`);
-    }
-    if (rt.nextTickAt) parts.push(`next ${when(rt.nextTickAt)}`);
-    runtime = parts.join(' · ');
-  } catch (err) {
-    deps.log.debug('runtimeInfo failed', { watchId: w.id, err: errMessage(err) });
-  }
-
-  const st = state.status;
-  const statusLine = w.paused
-    ? '⏸️ paused'
-    : st.up
-      ? '🟢 up'
-      : `🔴 down${st.downSince ? ` since ${when(st.downSince)}` : ''}${st.lastError ? ` (${escapeMarkdown(truncate(st.lastError, 200))})` : ''}`;
-
-  const deploy = state.deploy;
-  const buildParts: string[] = [];
-  if (deploy?.buildId) buildParts.push(codeSpan(deploy.buildId, 80));
-  if (deploy) buildParts.push(`${deploy.assets.length} bundles`);
-  if (deploy?.generator) buildParts.push(escapeMarkdown(truncate(deploy.generator, 80)));
-
-  const fields = [
-    { name: 'URL', value: truncate(w.url, 1000), inline: false },
-    { name: 'Channel', value: channelMention(w.channelId), inline: true },
-    { name: 'Schedule', value: `every ${w.intervalSec}s · all pages ~${formatDuration(w.sweepSec * 1000)}`, inline: true },
-    { name: 'Status', value: `${statusLine}${w.baselineDone ? '' : ' · baseline pending'}`, inline: true },
-    { name: 'Checks', value: FEATURES.map(([k, label]) => `${w.features[k] ? '✅' : '❌'} ${label}`).join('\n'), inline: true },
-    {
-      name: 'Pages',
-      value: `${tracked.length} tracked (max ${w.maxPages}) · ${knownPages} known\n${files} files · ${gone} gone · ${dynamic} too dynamic`,
-      inline: true,
-    },
-    { name: 'Subdomains', value: w.features.subdomains ? `${subs.length} known · ${alive} live${ctNote(deps)}` : 'off', inline: true },
-    { name: 'Build', value: buildParts.length ? buildParts.join(' · ') : 'unknown', inline: true },
-    { name: 'Last check', value: when(state.lastCheckAt), inline: true },
-    { name: 'Last change', value: when(state.lastChangeAt), inline: true },
-    { name: 'Ping', value: roleMention(w.pingRoleId, guildId), inline: true },
-    { name: 'Scope', value: w.scopePath ? codeSpan(w.scopePath, 200) : 'whole site', inline: true },
-    { name: 'Ignore numbers', value: w.maskNumbers ? 'yes' : 'auto', inline: true },
-    { name: 'Runtime', value: runtime, inline: false },
-  ];
-  if (state.lastError) fields.push({ name: 'Last error', value: codeSpan(state.lastError, 900), inline: false });
-  const perms = permsWarning(i, w.channelId);
-  if (perms) fields.push({ name: 'Delivery', value: perms, inline: false });
-  if (w.ignorePatterns.length) fields.push({ name: 'Ignored text', value: patternList(w.ignorePatterns), inline: false });
-  if (w.excludePatterns.length) fields.push({ name: 'Excluded URLs', value: patternList(w.excludePatterns), inline: false });
-  if (w.extraUrls.length) {
-    fields.push({ name: 'Extra pages', value: linesWithin(w.extraUrls.map((u) => truncate(u, 200)), 20, 1024), inline: false });
-  }
-  await respond(
-    i,
-    {
-      embeds: [
-        {
-          title: `#${w.id} ${nameOf(w)}`,
-          url: w.url,
-          color: ALERT_COLORS.info,
-          fields,
-          footer: { text: `Added ${new Date(w.createdAt).toISOString().slice(0, 10)}` },
-        },
-      ],
-    },
-    true,
-    deps.log,
-  );
-}
-
-async function cmdCheck({ i, deps, guildId }: Ctx): Promise<void> {
-  const w = resolveSite(i, deps, guildId);
-  const full = i.options.getBoolean('full') ?? false;
-  await defer(i, true, deps.log);
+/** Run a check (bounded by REPLY_DEADLINE_MS) and describe the outcome. Throws if the check itself crashes. */
+export async function runCheck(deps: CommandDeps, w: Watch, full: boolean, i?: Pick<Repliable, 'guild'>): Promise<string> {
   const check = deps.monitor.checkNow(w.id, { full });
   const timely = await withDeadline(check, REPLY_DEADLINE_MS);
   if (!timely.done) {
     check.catch((err: unknown) => deps.log.warn('check failed', { watchId: w.id, err: errMessage(err) }));
-    await respond(i, { content: `⏳ Still checking **${nameOf(w)}** — any alerts will be posted to ${channelMention(w.channelId)}.` }, true, deps.log);
-    return;
+    return `⏳ Still checking **${nameOf(w)}** — any alerts will be posted to ${channelMention(w.channelId)}.`;
   }
   const res = timely.value;
   const n = res.alerts.length;
@@ -1019,172 +889,126 @@ async function cmdCheck({ i, deps, guildId }: Ctx): Promise<void> {
   const perms = permsWarning(i, w.channelId);
   if (perms) lines.push(perms);
   if (w.paused) lines.push('ℹ️ This site is paused, so it is only checked on demand.');
-  await respond(i, { content: lines.join('\n') }, true, deps.log);
+  return lines.join('\n');
 }
 
-async function cmdPause({ i, deps, guildId }: Ctx, paused: boolean): Promise<void> {
-  const w = resolveSite(i, deps, guildId);
-  if (w.paused === paused) {
-    await respond(i, { content: `**${nameOf(w)}** is already ${paused ? 'paused' : 'running'}.` }, true, deps.log);
-    return;
-  }
-  const updated = deps.store.updateWatch(w.id, { paused });
-  notifyUpdated(deps, updated);
-  await respond(
-    i,
-    { content: paused ? `⏸️ Paused **${nameOf(w)}** — no checks until \`/watch resume\`.` : `▶️ Resumed **${nameOf(w)}**.` },
-    false,
-    deps.log,
-  );
+// ---------------------------------------------------------------------------
+// Renderers (site card, pages, subdomains, history, help)
+// ---------------------------------------------------------------------------
+
+export interface SiteStatus {
+  emoji: string;
+  label: string;
+  color: number;
 }
 
-async function cmdSet({ i, deps, guildId }: Ctx): Promise<void> {
-  const { store, config } = deps;
-  const w = resolveSite(i, deps, guildId);
-  const patch: WatchPatch = {};
-  const changes: string[] = [];
-
-  const name = cleanName(i.options.getString('name'));
-  if (name !== null && name !== w.name) {
-    if (nameTaken(deps, guildId, name, w.id)) throw new UserError(`A site named **${escapeMarkdown(name)}** already exists.`);
-    patch.name = name;
-    changes.push(`name: **${nameOf(w)}** → **${escapeMarkdown(name)}**`);
-  }
-  const channel = i.options.getChannel('channel');
-  if (channel && channel.id !== w.channelId) {
-    patch.channelId = channel.id;
-    changes.push(`channel: ${channelMention(w.channelId)} → ${channelMention(channel.id)}`);
-  }
-  const interval = intOption(i, 'interval', minInterval(config), MAX_INTERVAL_SEC, 's');
-  if (interval !== null && interval !== w.intervalSec) {
-    patch.intervalSec = interval;
-    changes.push(`interval: ${w.intervalSec}s → ${interval}s`);
-  }
-  const sweep = intOption(i, 'sweep', SWEEP_MIN_SEC, SWEEP_MAX_SEC, 's');
-  if (sweep !== null && sweep !== w.sweepSec) {
-    patch.sweepSec = sweep;
-    changes.push(`full sweep: ${w.sweepSec}s → ${sweep}s`);
-  }
-  const ping = i.options.getRole('ping');
-  const clearPing = i.options.getBoolean('clear_ping') ?? false;
-  if (ping && clearPing) throw new UserError('Use either `ping` or `clear_ping`, not both.');
-  if (ping && ping.id !== w.pingRoleId) {
-    patch.pingRoleId = ping.id;
-    changes.push(`ping: ${roleMention(w.pingRoleId, guildId)} → ${roleMention(ping.id, guildId)}`);
-  } else if (clearPing && w.pingRoleId) {
-    patch.pingRoleId = null;
-    changes.push(`ping: ${roleMention(w.pingRoleId, guildId)} → none`);
-  }
-  const maxPages = intOption(i, 'max_pages', 1, MAX_PAGES_LIMIT);
-  if (maxPages !== null && maxPages !== w.maxPages) {
-    patch.maxPages = maxPages;
-    changes.push(`max pages: ${w.maxPages} → ${maxPages}`);
-  }
-  const scope = parseScope(i.options.getString('scope'));
-  if (scope !== undefined && scope !== w.scopePath) {
-    patch.scopePath = scope;
-    changes.push(`scope: ${w.scopePath ? codeSpan(w.scopePath, 200) : 'whole site'} → ${scope ? codeSpan(scope, 200) : 'whole site'}`);
-  }
-  const features: Partial<WatchFeatures> = {};
-  for (const [key, label, option] of FEATURES) {
-    const v = i.options.getBoolean(option);
-    if (v === null || v === undefined || v === w.features[key]) continue;
-    features[key] = v;
-    changes.push(`${label}: ${v ? 'on' : 'off'}`);
-  }
-  if (Object.keys(features).length) patch.features = { ...w.features, ...features };
-  const ignoreNumbers = i.options.getBoolean('ignore_numbers');
-  if (ignoreNumbers !== null && ignoreNumbers !== undefined && ignoreNumbers !== w.maskNumbers) {
-    patch.maskNumbers = ignoreNumbers;
-    changes.push(`ignore number-only changes: ${ignoreNumbers ? 'on' : 'off'}`);
-  }
-
-  if (!changes.length) {
-    await respond(i, { content: `Nothing to change for **${nameOf(w)}** — pass at least one new setting.` }, true, deps.log);
-    return;
-  }
-  const updated = store.updateWatch(w.id, patch);
-  notifyUpdated(deps, updated);
-  deps.log.info('watch updated', { watchId: w.id, by: i.user.id, changes: Object.keys(patch) });
-  const lines = [`⚙️ Updated **${nameOf(updated)}**:`, ...changes.map((c) => `• ${c}`)];
-  if (patch.channelId) {
-    const perms = permsWarning(i, patch.channelId);
-    if (perms) lines.push(perms);
-  }
-  await respond(i, { content: lines.join('\n') }, false, deps.log);
+/** Paused ⏸️ > first scan pending ⏳ > down 🔴 > up 🟢. */
+export function siteStatus(w: Watch, state: Pick<WatchState, 'status'> | null | undefined): SiteStatus {
+  if (w.paused) return { emoji: '⏸️', label: 'Paused', color: ALERT_COLORS.info };
+  if (!w.baselineDone) return { emoji: '⏳', label: 'First scan pending', color: ALERT_COLORS.text };
+  if (state && state.status && !state.status.up) return { emoji: '🔴', label: 'Down', color: ALERT_COLORS.statusDown };
+  return { emoji: '🟢', label: 'Up', color: ALERT_COLORS.statusUp };
 }
 
-async function cmdPatterns({ i, deps, guildId }: Ctx, kind: 'ignore' | 'exclude'): Promise<void> {
-  const w = resolveSite(i, deps, guildId);
-  const remove = i.options.getBoolean('remove') ?? false;
-  const raw = i.options.getString('pattern', true).trim();
-  const current = kind === 'ignore' ? w.ignorePatterns : w.excludePatterns;
-  let next: string[];
-  let message: string;
-  if (remove) {
-    if (!current.includes(raw)) {
-      throw new UserError(`${codeSpan(raw, 200)} is not in the list. Current patterns:\n${patternList(current)}`);
+/** Watch state, or null if it can't be read. */
+export function safeState(store: Pick<Store, 'getState'>, watchId: number): WatchState | null {
+  try {
+    return store.getState(watchId);
+  } catch {
+    return null;
+  }
+}
+
+function runtimeLine(deps: CommandDeps, w: Watch): string {
+  try {
+    const rt = deps.monitor.runtimeInfo(w.id);
+    const parts = [rt.running ? 'running' : 'stopped'];
+    if (rt.baselineRunning) parts.push('baseline scan in progress');
+    if (typeof rt.lastTickMs === 'number') {
+      parts.push(`last check took ${rt.lastTickMs < 1000 ? `${Math.round(rt.lastTickMs)}ms` : formatDuration(rt.lastTickMs)}`);
     }
-    next = current.filter((p) => p !== raw);
-    message =
-      kind === 'ignore'
-        ? `👁️ **${nameOf(w)}** no longer ignores ${codeSpan(raw, 300)}.`
-        : `↩️ **${nameOf(w)}** no longer excludes URLs matching ${codeSpan(raw, 300)}.`;
-  } else {
-    const pattern = validatePattern(raw, kind);
-    if (current.includes(pattern)) throw new UserError(`${codeSpan(pattern, 200)} is already in the list.`);
-    if (current.length >= MAX_PATTERNS) throw new UserError(`At most ${MAX_PATTERNS} patterns per site. Remove one first.`);
-    next = [...current, pattern];
-    message =
-      kind === 'ignore'
-        ? `🙈 **${nameOf(w)}** now ignores text matching ${codeSpan(pattern, 300)}.`
-        : `🚫 **${nameOf(w)}** now skips URLs matching ${codeSpan(pattern, 300)}.`;
-    if (kind === 'exclude') {
-      try {
-        if (new RegExp(pattern, 'i').test(w.url)) message += '\n⚠️ This pattern also matches the start URL.';
-      } catch {
-        // validated above
-      }
-    }
+    if (rt.nextTickAt) parts.push(`next ${when(rt.nextTickAt)}`);
+    return parts.join(' · ');
+  } catch (err) {
+    deps.log.debug('runtimeInfo failed', { watchId: w.id, err: errMessage(err) });
+    return 'unknown';
   }
-  // Ignore patterns change the compared text: clear the noise heuristics so pages are re-judged under the new rules.
-  if (kind === 'ignore') deps.store.resetPageNoise(w.id);
-  const updated = deps.store.updateWatch(w.id, kind === 'ignore' ? { ignorePatterns: next } : { excludePatterns: next });
-  notifyUpdated(deps, updated);
-  message += `\nPages are re-baselined silently (${next.length} ${next.length === 1 ? 'pattern' : 'patterns'} active).`;
-  await respond(i, { content: message }, false, deps.log);
 }
 
-async function cmdAddPage({ i, deps, guildId }: Ctx): Promise<void> {
-  const w = resolveSite(i, deps, guildId);
-  const raw = i.options.getString('url', true);
-  const remove = i.options.getBoolean('remove') ?? false;
-  const url = resolvePageUrl(raw, w);
-  if (!url) throw new UserError(`${codeSpan(raw, 100)} is not a valid http(s) URL or path.`);
-  const idx = w.extraUrls.findIndex((u) => (normalizeUrl(u) ?? u) === url);
-  let next: string[];
-  let message: string;
-  if (remove) {
-    if (idx < 0) {
-      const list = w.extraUrls.length ? linesWithin(w.extraUrls.map((u) => `• <${truncate(u, 200)}>`), 20, 1500) : 'none';
-      throw new UserError(`<${url}> is not an extra page of **${nameOf(w)}**. Extra pages:\n${list}`);
-    }
-    next = w.extraUrls.filter((_, n) => n !== idx);
-    message = `📌 Stopped tracking <${url}> as an extra page of **${nameOf(w)}**.`;
-  } else {
-    if (idx >= 0) throw new UserError(`<${url}> is already tracked for **${nameOf(w)}**.`);
-    if (w.extraUrls.length >= MAX_EXTRA_URLS) throw new UserError(`At most ${MAX_EXTRA_URLS} extra pages per site. Remove one first.`);
-    next = [...w.extraUrls, url];
-    message = `📌 Now also tracking <${url}> for **${nameOf(w)}**.`;
-  }
-  const updated = deps.store.updateWatch(w.id, { extraUrls: next });
-  notifyUpdated(deps, updated);
-  await respond(i, { content: message }, false, deps.log);
+/** Compact on/off grid of every switch, four per line. */
+export function featureGrid(w: Watch): string {
+  const cells = FEATURE_TOGGLES.map((t) => `${toggleValue(w, t.key) ? '✅' : '⬜'} ${t.label}`);
+  const rows: string[] = [];
+  for (let n = 0; n < cells.length; n += 4) rows.push(cells.slice(n, n + 4).join(' · '));
+  return rows.join('\n');
 }
 
-async function cmdPages({ i, deps, guildId }: Ctx): Promise<void> {
+function plural(n: number, one: string, many = `${one}s`): string {
+  return `${n} ${n === 1 ? one : many}`;
+}
+
+/** The site card: status, schedule, delivery, counts, build, rules, checks, runtime. */
+export function renderSiteInfo(deps: CommandDeps, w: Watch, i?: Pick<Repliable, 'guild'>): APIEmbed {
   const { store } = deps;
-  const w = resolveSite(i, deps, guildId);
+  const state = safeState(store, w.id) ?? null;
+  const tracked = store.listPages(w.id, { kind: 'page', tracked: true });
+  const knownPages = store.countPages(w.id, { kind: 'page' });
+  const files = store.countPages(w.id, { kind: 'file' });
+  const subs = store.listSubdomains(w.id);
+  const alive = subs.filter((s) => s.alive).length;
+  const gone = tracked.filter((p) => p.gone).length;
+  const dynamic = tracked.filter((p) => p.dynamic).length;
+
+  const st = siteStatus(w, state);
+  let statusLine = `${st.emoji} **${st.label}**`;
+  if (state && !w.paused && !state.status.up) {
+    if (state.status.downSince) statusLine += ` since ${when(state.status.downSince)}`;
+    if (state.status.lastError) statusLine += ` (${escapeMarkdown(truncate(state.status.lastError, 200))})`;
+  }
+  statusLine += ` · last check ${when(state?.lastCheckAt)} · last change ${when(state?.lastChangeAt)}`;
+
+  const deploy = state?.deploy ?? null;
+  const buildParts: string[] = [];
+  if (deploy?.buildId) buildParts.push(codeSpan(deploy.buildId, 80));
+  if (deploy) buildParts.push(`${deploy.assets.length} bundles`);
+  if (deploy?.generator) buildParts.push(escapeMarkdown(truncate(deploy.generator, 80)));
+
+  const rules = [
+    plural(w.ignorePatterns.length, 'ignore pattern'),
+    plural(w.excludePatterns.length, 'skipped URL pattern'),
+    plural(w.extraUrls.length, 'extra page'),
+    `scope: ${w.scopePath ? codeSpan(w.scopePath, 100) : 'whole site'}`,
+  ];
+
+  const fields: APIEmbedField[] = [
+    { name: 'Schedule', value: `every ${w.intervalSec}s\nall pages ~${formatDuration(w.sweepSec * 1000)}`, inline: true },
+    { name: 'Alerts', value: `${channelMention(w.channelId)}\nping: ${roleMention(w.pingRoleId, w.guildId)}`, inline: true },
+    { name: 'Build', value: buildParts.length ? buildParts.join(' · ') : 'unknown', inline: true },
+    {
+      name: 'Pages',
+      value: `${tracked.length} tracked (max ${w.maxPages}) · ${knownPages} known\n${files} files · ${gone} gone · ${dynamic} too dynamic`,
+      inline: true,
+    },
+    { name: 'Subdomains', value: w.features.subdomains ? `${subs.length} known · ${alive} live${ctNote(deps)}` : `off (${subs.length} known)`, inline: true },
+    { name: 'Rules', value: rules.join('\n'), inline: true },
+    { name: 'Checks', value: featureGrid(w), inline: false },
+    { name: 'Runtime', value: runtimeLine(deps, w), inline: false },
+  ];
+  if (state?.lastError) fields.push({ name: 'Last error', value: codeSpan(state.lastError, 900), inline: false });
+  const perms = permsWarning(i, w.channelId);
+  if (perms) fields.push({ name: 'Delivery', value: perms, inline: false });
+  return {
+    title: `${st.emoji} ${nameOf(w)}`,
+    url: w.url,
+    color: st.color,
+    description: `${truncate(w.url, 500)}\n${statusLine}`,
+    fields,
+    footer: { text: `#${w.id} · ${w.host} · added ${new Date(w.createdAt).toISOString().slice(0, 10)}` },
+  };
+}
+
+export function renderPages(deps: CommandDeps, w: Watch): APIEmbed {
+  const { store } = deps;
   const tracked = store.listPages(w.id, { kind: 'page', tracked: true });
   const known = store.countPages(w.id, { kind: 'page' });
   const files = store.listPages(w.id, { kind: 'file' });
@@ -1200,7 +1024,7 @@ async function cmdPages({ i, deps, guildId }: Ctx): Promise<void> {
     return line;
   });
   const embed: APIEmbed = {
-    title: `Pages of ${nameOf(w)}`,
+    title: `📄 Pages of ${nameOf(w)}`,
     url: w.url,
     color: ALERT_COLORS.info,
     description: `${head}\n\n${lines.length ? linesWithin(lines, PAGES_LISTED, 3800) : '_No pages tracked yet._'}`,
@@ -1217,68 +1041,41 @@ async function cmdPages({ i, deps, guildId }: Ctx): Promise<void> {
       },
     ];
   }
-  await respond(i, { embeds: [embed] }, true, deps.log);
+  return embed;
 }
 
 const SUB_SOURCE: Record<string, string> = { ct: 'CT', crtsh: 'crt.sh', dns: 'DNS', link: 'link', code: 'code' };
 
-async function cmdSubdomains({ i, deps, guildId }: Ctx): Promise<void> {
-  const w = resolveSite(i, deps, guildId);
+export function renderSubdomains(deps: CommandDeps, w: Watch): APIEmbed {
   const subs = deps.store.listSubdomains(w.id).sort((a, b) => Number(b.alive) - Number(a.alive) || a.host.localeCompare(b.host));
   const alive = subs.filter((s) => s.alive).length;
   const lines = subs.map(
     (s) => `${s.alive ? '🟢' : '⚪'} ${codeSpan(s.host, 100)} · ${s.sources.map((src) => SUB_SOURCE[src] ?? src).join(', ') || '?'}`,
   );
-  const off = w.features.subdomains ? '' : '\n_Subdomain detection is off for this site (`/watch set subdomains:true`)._';
-  await respond(
-    i,
-    {
-      embeds: [
-        {
-          title: `Subdomains of ${escapeMarkdown(w.rootDomain)}`,
-          color: ALERT_COLORS.subdomain,
-          description: `**${subs.length}** known · **${alive}** live${off}\n\n${
-            lines.length ? linesWithin(lines, SUBDOMAINS_LISTED, 3800) : '_None found yet._'
-          }`,
-          footer: { text: `${w.name} · ${w.host}` },
-        },
-      ],
-    },
-    true,
-    deps.log,
-  );
+  const off = w.features.subdomains ? '' : '\n_Subdomain detection is off for this site (turn it on under 🧩 Features)._';
+  return {
+    title: `🛰️ Subdomains of ${escapeMarkdown(w.rootDomain)}`,
+    color: ALERT_COLORS.subdomain,
+    description: `**${subs.length}** known · **${alive}** live${off}\n\n${lines.length ? linesWithin(lines, SUBDOMAINS_LISTED, 3800) : '_None found yet._'}`,
+    footer: { text: `${w.name} · ${w.host}` },
+  };
 }
 
-async function cmdHistory({ i, deps, guildId }: Ctx): Promise<void> {
-  const w = resolveSite(i, deps, guildId);
-  const limit = intOption(i, 'limit', 1, 25) ?? 10;
-  const events = deps.store.listEvents(w.id, limit);
-  if (!events.length) {
-    await respond(i, { content: `No alerts yet for **${nameOf(w)}**.` }, true, deps.log);
-    return;
-  }
+export function renderHistory(deps: CommandDeps, w: Watch, limit = 15): APIEmbed {
+  const events = deps.store.listEvents(w.id, Math.max(1, Math.min(25, limit)));
   const lines = events.map(
     (e) => `<t:${unix(e.createdAt)}:R> ${KIND_EMOJI[e.kind] ?? '•'} ${escapeMarkdown(truncate(e.summary.replace(/[\r\n]+/g, ' '), 150))}`,
   );
-  await respond(
-    i,
-    {
-      embeds: [
-        {
-          title: `Recent alerts — ${nameOf(w)}`,
-          color: ALERT_COLORS.info,
-          description: linesWithin(lines, 25, 4000),
-        },
-      ],
-    },
-    true,
-    deps.log,
-  );
+  return {
+    title: `🕘 Recent alerts — ${nameOf(w)}`,
+    color: ALERT_COLORS.info,
+    description: lines.length ? linesWithin(lines, 25, 4000) : `_No alerts yet for **${nameOf(w)}**._`,
+  };
 }
 
-async function cmdHelp({ i, deps }: Ctx): Promise<void> {
+export function renderHelp(): APIEmbed {
   const description = [
-    'I watch websites 24/7 and post here the moment something changes:',
+    'I watch websites 24/7 and post the moment something changes:',
     '🌐 **Redeploys** — new JS/CSS bundles or build id',
     '📝 **Text changes** — visible text on tracked pages, with a diff',
     '🆕 **New / removed pages** — from links, sitemaps and routes in the site code',
@@ -1286,55 +1083,135 @@ async function cmdHelp({ i, deps }: Ctx): Promise<void> {
     '📄 **Files** — linked PDFs, docs, markdown…',
     '🔴 **Downtime** — site down / back up',
   ].join('\n');
+  const dashboard = [
+    '`/panel` posts the dashboard in a channel. From it:',
+    '➕ **Add site** · pick a site from the menu to open its card',
+    '⚡ check now · ⏸️ pause / ▶️ resume · ⚙️ settings (name, interval, channel, ping role)',
+    '🧩 checks on/off · 🚫 rules (ignored text, skipped URLs, extra pages, scope)',
+    '📄 pages · 🛰️ subdomains · 🕘 history · 🗑️ remove',
+  ].join('\n');
   const commands = [
-    '`/watch add url:unpeg.io` — start watching (first scan is silent)',
-    '`/watch list` · `/watch info` — what is watched and how it is doing',
+    '`/watch add url:unpeg.io` — start watching (the first scan is silent)',
+    '`/watch list` — everything being watched',
     '`/watch check` — check right now',
-    '`/watch set` — interval, channel, ping role, checks on/off…',
-    '`/watch pause` · `/watch resume` · `/watch remove`',
-    '`/watch pages` · `/watch subdomains` · `/watch history`',
-    '`/watch addpage` — also track an unlinked page or file',
+    '`/watch remove` — stop watching',
   ].join('\n');
   const tips = [
-    'Noisy page? `/watch ignore pattern:` strips matching text before comparing.',
-    'Skip whole sections with `/watch exclude pattern:/blog/`.',
-    'Counters and prices that tick constantly are detected automatically; force it with `/watch set ignore_numbers:true`.',
+    'Noisy page? Add an ignore pattern under 🚫 Rules — matching text is stripped before comparing.',
+    'Skip whole sections with a URL pattern like `/blog/`.',
+    'Counters and prices that tick constantly are detected automatically; force it with 🔢 Ignore numbers.',
   ].join('\n');
+  return {
+    title: '📖 Site Watcher — help',
+    color: ALERT_COLORS.info,
+    description,
+    fields: [
+      { name: 'Dashboard', value: dashboard },
+      { name: 'Commands', value: commands },
+      { name: 'Tips', value: tips },
+    ],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+interface Ctx {
+  i: ChatInputCommandInteraction;
+  deps: CommandDeps;
+  guildId: string;
+}
+
+async function cmdAdd({ i, deps, guildId }: Ctx): Promise<void> {
+  const prepared = prepareAdd(deps, {
+    guildId,
+    channelId: i.options.getChannel('channel')?.id ?? i.channelId,
+    userId: i.user.id,
+    url: i.options.getString('url', true),
+    name: i.options.getString('name'),
+    intervalSec: i.options.getInteger('interval'),
+    pingRoleId: i.options.getRole('ping')?.id ?? null,
+  });
+  await defer(i, false, deps.log);
+  await finishAdd(deps, prepared, (body) => respond(i, body, false, deps.log), i);
+}
+
+async function cmdRemove({ i, deps, guildId }: Ctx): Promise<void> {
+  const w = resolveSite(i, deps, guildId);
+  removeWatch(deps, w, i.user.id);
+  await respond(i, { content: `🗑️ Stopped watching **${nameOf(w)}** (<${w.url}>).` }, false, deps.log);
+}
+
+async function cmdList({ i, deps, guildId }: Ctx): Promise<void> {
+  const watches = deps.store.listWatches(guildId);
+  if (!watches.length) {
+    await respond(i, { content: 'No sites are watched in this server yet. Add one with `/watch add url:unpeg.io` or from the `/panel` dashboard.' }, false, deps.log);
+    return;
+  }
+  const lines = watches.map(
+    (w) =>
+      `**#${w.id} ${nameOf(w)}** — ${truncate(w.url, 300)} · every ${w.intervalSec}s · ${channelMention(w.channelId)}${
+        missingChannelPerms(i, w.channelId).length ? ' ⚠️' : ''
+      } · ${featureSummary(w.features)}${w.paused ? ' · ⏸️ paused' : ''}`,
+  );
   await respond(
     i,
     {
       embeds: [
         {
-          title: 'Site Watcher — help',
+          title: `Watched sites (${watches.length})`,
           color: ALERT_COLORS.info,
-          description,
-          fields: [
-            { name: 'Commands', value: commands },
-            { name: 'Tips', value: tips },
-          ],
+          description: linesWithin(lines, 100, 4000, (n) => `…and ${n} more — see the \`/panel\` dashboard.`),
         },
       ],
     },
-    true,
+    false,
     deps.log,
   );
+}
+
+async function cmdCheck({ i, deps, guildId }: Ctx): Promise<void> {
+  const w = resolveSite(i, deps, guildId);
+  const full = i.options.getBoolean('full') ?? false;
+  await defer(i, true, deps.log);
+  const content = await runCheck(deps, w, full, i);
+  await respond(i, { content }, true, deps.log);
+}
+
+async function cmdHelp({ i, deps }: Ctx): Promise<void> {
+  await respond(i, { embeds: [renderHelp()] }, true, deps.log);
+}
+
+async function cmdPanel({ i, deps, guildId }: Ctx): Promise<void> {
+  requireManageGuild(i);
+  let host: PanelHost | null | undefined;
+  try {
+    host = deps.panel;
+  } catch {
+    host = null;
+  }
+  if (!host) throw new UserError('The dashboard is not available right now — try again in a few seconds.');
+  await defer(i, true, deps.log);
+  let url: string;
+  try {
+    url = await host.placePanel(guildId, i.channelId);
+  } catch (err) {
+    if (ACCESS_ERROR_CODES.has(errorCode(err) as number)) {
+      throw new UserError(
+        "I can't post the dashboard here. I need **View Channel**, **Send Messages**, **Embed Links**, **Attach Files** and **Pin Messages** in this channel.",
+      );
+    }
+    throw err;
+  }
+  await respond(i, { content: `📌 Dashboard posted: ${url}\nPick a site from its menu to manage it, or press **Add site**.` }, true, deps.log);
 }
 
 const HANDLERS: Record<string, (ctx: Ctx) => Promise<void>> = {
   add: cmdAdd,
   remove: cmdRemove,
   list: cmdList,
-  info: cmdInfo,
   check: cmdCheck,
-  pause: (c) => cmdPause(c, true),
-  resume: (c) => cmdPause(c, false),
-  set: cmdSet,
-  ignore: (c) => cmdPatterns(c, 'ignore'),
-  exclude: (c) => cmdPatterns(c, 'exclude'),
-  addpage: cmdAddPage,
-  pages: cmdPages,
-  subdomains: cmdSubdomains,
-  history: cmdHistory,
   help: cmdHelp,
 };
 
@@ -1343,21 +1220,26 @@ const HANDLERS: Record<string, (ctx: Ctx) => Promise<void>> = {
 // ---------------------------------------------------------------------------
 
 export async function handleChatInput(interaction: ChatInputCommandInteraction, deps: CommandDeps): Promise<void> {
-  let sub = '';
+  let what = `/${COMMAND_NAME}`;
   try {
     if (!interaction.inGuild() || !interaction.guildId) {
       await respond(interaction, { content: 'This command only works inside a server.' }, true, deps.log);
       return;
     }
-    sub = interaction.options.getSubcommand(false) ?? '';
-    const handler = HANDLERS[sub];
-    if (!handler) throw new UserError(`Unknown subcommand \`${truncate(sub, 32) || '?'}\`.`);
-    if (PRIVILEGED.has(sub) && !hasManageGuild(interaction)) {
-      throw new UserError('You need the **Manage Server** permission to do that.');
+    const ctx: Ctx = { i: interaction, deps, guildId: interaction.guildId };
+    if (interaction.commandName === PANEL_COMMAND_NAME) {
+      what = `/${PANEL_COMMAND_NAME}`;
+      await cmdPanel(ctx);
+      return;
     }
-    await handler({ i: interaction, deps, guildId: interaction.guildId });
+    const sub = interaction.options.getSubcommand(false) ?? '';
+    what = `/${COMMAND_NAME} ${sub}`;
+    const handler = HANDLERS[sub];
+    if (!handler) throw new UserError(`Unknown subcommand \`${truncate(sub, 32) || '?'}\` — the rest lives on the \`/panel\` dashboard.`);
+    if (PRIVILEGED.has(sub)) requireManageGuild(interaction);
+    await handler(ctx);
   } catch (err) {
-    await replyError(interaction, err, deps.log, `/watch ${sub}`);
+    await replyError(interaction, err, deps.log, what);
   }
 }
 

@@ -8,6 +8,8 @@ import type { CheckContext } from './context.js';
 
 /** Consecutive failed ticks before a DOWN alert. */
 export const DOWN_AFTER_FAILURES = 3;
+/** ...and the outage must also have lasted this long, so fast intervals (2s) don't turn a brief blip into a DOWN alert. */
+export const DOWN_MIN_MS = 20_000;
 /** Consecutive blocked (bot challenge) ticks before a one-time info alert. */
 export const BLOCKED_AFTER = 3;
 /**
@@ -113,7 +115,8 @@ export function updateStatus(ctx: CheckContext, home: FetchResult): Array<Status
     else if (st.downSince === null) st.downSince = now;
     st.consecutiveFailures = failures + 1;
     st.lastError = detail;
-    if (st.consecutiveFailures >= DOWN_AFTER_FAILURES) {
+    const outageMs = st.downSince !== null && Number.isFinite(st.downSince) ? now - st.downSince : 0;
+    if (st.consecutiveFailures >= DOWN_AFTER_FAILURES && (st.alertedDown || outageMs >= DOWN_MIN_MS)) {
       st.up = false;
       if (!st.alertedDown && statusAlerts) {
         st.alertedDown = true;

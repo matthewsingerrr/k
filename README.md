@@ -30,7 +30,7 @@ Every site starts with a silent **baseline** scan, so you only get alerts for re
 
 1. Go to <https://discord.com/developers/applications> and click **New Application**, then name it (for example "Site Watcher").
 2. Open the **Bot** tab and click **Reset Token**. Copy the token; it goes in `DISCORD_TOKEN`. No privileged intents are needed.
-3. Open the **OAuth2** tab. Under **URL Generator**, tick the scopes `bot` and `applications.commands`, and the bot permissions **View Channels**, **Send Messages**, **Embed Links**, **Read Message History** and **Mention Everyone** (Mention Everyone is only needed to ping roles that aren't mentionable).
+3. Open the **OAuth2** tab. Under **URL Generator**, tick the scopes `bot` and `applications.commands`, and the bot permissions **View Channels**, **Send Messages**, **Embed Links**, **Read Message History**, **Attach Files**, **Pin Messages** and **Mention Everyone** (Attach Files and Pin Messages are for the dashboard and its backup; Mention Everyone is only needed to ping roles that aren't mentionable).
    Open the generated URL and add the bot to your server. The bot also prints a ready-made invite link in its logs on startup.
 4. **Make the bot private.** New applications are "public": anyone who finds the bot could add it to their own server and use your Railway resources. Open **Installation** and set **Install Link** to **None** (Discord refuses the next step while an install link is set), then open **Bot** and turn off **Public Bot**. Also set `DISCORD_GUILD_ID` (step 2) to your server's id: the bot then serves only that server, leaves any other server it is added to, and ignores commands from elsewhere.
 
@@ -38,9 +38,8 @@ Every site starts with a silent **baseline** scan, so you only get alerts for re
 
 1. Push this repo to GitHub. In Railway, choose **New Project**, then **Deploy from GitHub repo**, and pick this repo. Railway builds it from the `Dockerfile` (see `railway.json`).
 2. Under the service's **Variables**, set `DISCORD_TOKEN` and (recommended) `DISCORD_GUILD_ID` — right-click your server icon → **Copy Server ID** (turn on Developer Mode in Discord's Advanced settings first).
-3. **Attach a volume** (right-click the service, or open the command palette, then choose **Add Volume**) with mount path `/data`.
-   The bot automatically stores its database on the volume (`RAILWAY_VOLUME_MOUNT_PATH`).
-   Without a volume, every redeploy wipes your watch list.
+3. **Recommended: attach a volume** (right-click the service → **Add Volume**, mount path `/data`). The bot stores its database there automatically (`RAILWAY_VOLUME_MOUNT_PATH`), so page history and baselines survive redeploys too.
+   **Your site list survives redeploys either way.** The bot keeps a pinned **dashboard** message in Discord that carries a backup of every watched site and its settings. When a deploy starts with an empty database, the bot finds that backup and restores all sites automatically. Each restored site re-scans silently, so a redeploy never floods the channel. Give the bot the **Pin Messages** permission so the dashboard stays pinned.
 4. Deploy. The logs should show `Logged in as …`. `/health` answers `503` until the bot has logged in to Discord once, so a deploy with a bad token fails its healthcheck and the previous deployment keeps running. If Discord later rejects the token (you reset it), the process exits with a clear log line instead of running without Discord.
 5. Keep **one replica**. Two replicas would send every alert twice. `railway.json` gives the old deployment 20 seconds on redeploys to finish its current check and deliver its alerts.
 
@@ -48,40 +47,48 @@ Optional: get a free [Cert Spotter API key](https://sslmate.com/certspotter/api/
 
 ## 3. Use it
 
-All commands live under `/watch`. By default only members with **Manage Server** can see them; you can change this in Server Settings → Integrations.
+Run **`/panel`** in the channel where you want the dashboard. The bot posts and pins a live **Site Watcher** dashboard:
 
 ```
-/watch add url:unpeg.io                     # watch a site; alerts go to this channel
-/watch add url:https://unpeg.io/docs name:Unpeg channel:#alerts ping:@alpha interval:15
-/watch list                                 # everything being watched
-/watch info site:Unpeg                      # status, counts, build id, last change
-/watch check site:Unpeg                     # check right now
-/watch set site:Unpeg interval:20 subdomains:false text:true
-/watch ignore site:Unpeg pattern:Last updated.*   # strip a changing line before comparing
-/watch exclude site:Unpeg pattern:/blog/          # don't crawl matching URLs
-/watch addpage site:Unpeg url:/secret-page         # track a page that isn't linked anywhere
-/watch pages site:Unpeg                     # tracked pages
-/watch subdomains site:Unpeg                # known subdomains
-/watch history site:Unpeg                   # recent alerts
-/watch pause | resume | remove site:Unpeg
+🛰️ Site Watcher
+Watching 3 sites · alerts in #alerts
+🟢 2 up · ⏸️ 1 paused
+
+🟢 Unpeg · unpeg.io · every 2s · #alerts
+🟢 Docs · docs.foo.xyz · every 2s · #alerts
+⏸️ Bar · bar.app · every 5m · #alerts
+[ Manage a site… ▾ ]
+[➕ Add site] [🔄 Refresh] [📖 Help]
+```
+
+- **➕ Add site** opens a form: URL, name, check interval, alert channel and ping role.
+- **Manage a site…** opens a private card for that site with these buttons:
+  - ⚡ **Check now**, ⏸️ **Pause/Resume**, ⚙️ **Settings** (name, interval, sweep, channel, ping role) and 🗑️ **Remove**.
+  - 🧩 **Features** (toggle each alert type, including "ignore numbers").
+  - 🚫 **Rules** (ignore patterns, skipped URLs, extra pages, crawl scope, max pages).
+  - 📄 **Pages**, 🛰️ **Subdomains** and 🕘 **History**.
+- Clicks are answered privately, so the shared dashboard stays clean. Changing anything requires **Manage Server**.
+- The dashboard also holds the watch-list backup: don't delete it. If you do, the bot re-posts it. Run `/panel` again anywhere to move it.
+
+Slash commands for quick use (Manage Server only):
+
+```
+/panel                                   # post / move the dashboard here
+/watch add url:unpeg.io [name] [channel] [interval] [ping]
+/watch remove site:Unpeg
+/watch check site:Unpeg [full]
+/watch list
 /watch help
 ```
 
 Subdomain alerts have a **Watch <host>** button that starts watching that subdomain as its own site.
 
-Notes:
-
-- If the URL you add redirects to another host of the same site (`site.io` → `www.site.io`, `docs.x.io` → `developers.x.io`), the bot watches that host instead and says so. A redirect to another domain is reported; only the start page can be checked then.
-- Adding a second watch for the same site (for example `unpeg.io` and `docs.unpeg.io`) turns subdomain detection off on the new one when another watch already scans that domain, and names it after its subdomain or path ("Unpeg docs"). Redeploy and uptime alerts of one host come from every watch of that host; the reply tells you if there is overlap.
-- Changing `ignore`, `exclude`, `scope`, `ignore_numbers` or switching a check on only re-baselines what that setting affects (silently); all other checks keep alerting as usual.
-- A server can hold at most `MAX_WATCHES_PER_GUILD` watches (default 50).
-
 ### How fast is "instant"?
 
-- **Homepage, redeploys and uptime:** checked every `interval` seconds (default 30, minimum 10).
+- **Homepage, redeploys and uptime:** checked every `interval` seconds (default **2**, minimum 1). A DOWN alert needs 3 failed checks spanning at least 20 seconds, so one slow response doesn't page anyone.
 - **Other tracked pages:** re-checked on a rolling schedule so each one is covered at least every `sweep` seconds (default 120). A detected redeploy triggers an immediate full sweep of every page, so text changes that ship with a deploy arrive seconds after the redeploy alert.
 - **Subdomains:**
-  - *Hostnames in the site's own links or code:* the next check (about 30 seconds to 2 minutes).
+  - *Hostnames in the site's own links or code:* the next check (a few seconds to 2 minutes).
   - *Certificate Transparency (Cert Spotter):* the free quota is 10 queries an hour for the whole bot, shared by every watched domain, so each domain is polled about every `6 min × number of watched domains` (every 5 minutes with one domain). Most new subdomains get a TLS certificate, which appears in the CT logs within minutes, often before the site is announced.
   - *crt.sh* every 30 min (often slow or behind).
   - *DNS sweep* of about 250 common names every 15 min. Public resolvers cache "does not exist" answers for the zone's negative TTL (typically 30–60 minutes), so a brand-new name can take up to the sweep interval plus that TTL to show up this way.
@@ -97,7 +104,7 @@ Notes:
 | `CERTSPOTTER_API_KEY` | — | Optional: your own Certificate Transparency quota instead of one shared with the host's IP |
 | `CERTSPOTTER_QUERIES_PER_HOUR` | 10 | Cert Spotter budget for the whole bot (free plan: 10) |
 | `MAX_WATCHES_PER_GUILD` | 50 | Watches per Discord server (0 = no limit) |
-| `DEFAULT_INTERVAL_SEC` / `MIN_INTERVAL_SEC` | 30 / 10 | Homepage check cadence |
+| `DEFAULT_INTERVAL_SEC` / `MIN_INTERVAL_SEC` | 2 / 1 | Homepage check cadence |
 | `DEFAULT_SWEEP_SEC` | 120 | Full page re-check period |
 | `DEFAULT_MAX_PAGES` | 150 | Pages per site whose text is tracked |
 | `SUBDOMAIN_INTERVAL_SEC` / `CRTSH_INTERVAL_SEC` / `DNS_SCAN_INTERVAL_SEC` | 300 / 1800 / 900 | Subdomain discovery cadence |

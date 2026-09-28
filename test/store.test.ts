@@ -184,7 +184,7 @@ describe('Store: watches', () => {
       url: 'https://unpeg.io/',
       host: 'unpeg.io',
       rootDomain: 'unpeg.io',
-      intervalSec: 30,
+      intervalSec: 2,
       sweepSec: 120,
       maxPages: 150,
       pingRoleId: null,
