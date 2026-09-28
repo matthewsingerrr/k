@@ -48,6 +48,8 @@ export interface Config {
   /** Delay before the confirmation re-fetch of a changed page/fingerprint (ms). */
   confirmDelayMs: number;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
+  /** Post "Ver X has been updated! Enjoy" in each server after a deploy of new code. */
+  announceUpdates: boolean;
 }
 
 function int(name: string, fallback: number, min = 0): number {
@@ -116,6 +118,7 @@ export function loadConfig(opts: { requireToken?: boolean } = {}): Config {
     maxFileBytes: int('MAX_FILE_BYTES', 30 * 1024 * 1024, 1024),
     confirmDelayMs: int('CONFIRM_DELAY_MS', 2500, 0),
     logLevel: ['debug', 'info', 'warn', 'error'].includes(level) ? level : 'info',
+    announceUpdates: bool('ANNOUNCE_UPDATES', true),
   };
 }
 
@@ -148,6 +151,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     maxFileBytes: 30 * 1024 * 1024,
     confirmDelayMs: 0,
     logLevel: 'warn',
+    announceUpdates: false,
     ...overrides,
   };
 }

@@ -137,7 +137,7 @@ const MAX_EMBED_URL = 2000;
 const DIFF_TRUNCATED = '… (diff truncated)';
 const FOOTER_CHARS = 256;
 
-type Block = { embed: APIEmbed; buttonHost?: string };
+type Block = { embed: APIEmbed; buttonHost?: string; ignoreGlobs?: string[] };
 interface Rendered {
   content: string;
   blocks: Block[];
@@ -566,6 +566,33 @@ const SOURCE_NOTE: Partial<Record<PageSource, string>> = {
   redirect: 'redirect target',
 };
 
+/** Prefix of the "🚫 Ignore /folder/*" button custom ids on new-page alerts (`panel:exclude:<watchId>:<glob>`). */
+export const IGNORE_PATH_PREFIX = 'panel:exclude:';
+const MAX_IGNORE_BUTTONS = 3;
+
+/** Folder globs ("/profile/*") covering the new pages that sit in a sub-folder, most pages first; already-ignored ones skipped. */
+export function ignoreSuggestions(watch: Watch, urls: string[]): string[] {
+  const counts = new Map<string, number>();
+  const existing = new Set(arr(watch.excludePatterns));
+  for (const url of urls) {
+    let path: string;
+    try {
+      path = new URL(url).pathname;
+    } catch {
+      continue;
+    }
+    const segs = path.split('/').filter(Boolean);
+    if (segs.length < 2 || !/^[A-Za-z0-9\-._~%]+$/.test(segs[0])) continue;
+    const glob = `/${segs[0]}/*`;
+    if (existing.has(glob)) continue;
+    counts.set(glob, (counts.get(glob) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
+    .slice(0, MAX_IGNORE_BUTTONS)
+    .map(([g]) => g);
+}
+
 function renderNewPages(watch: Watch, a: NewPagesAlert): Rendered {
   const pages = arr(a.pages).filter((p) => p && p.url);
   const n = pages.length;
@@ -590,6 +617,10 @@ function renderNewPages(watch: Watch, a: NewPagesAlert): Rendered {
           color: ALERT_COLORS.new_pages,
           description: lineList(lines, NEW_PAGES_LISTED, LIST_DESC_BUDGET),
         },
+        ignoreGlobs: ignoreSuggestions(
+          watch,
+          pages.map((p) => p.url),
+        ),
       },
     ],
   };
@@ -846,8 +877,20 @@ function fallback(watch: Watch, alert: unknown): Rendered {
 // Packing into messages
 // ---------------------------------------------------------------------------
 
-function buttonRow(watch: Watch, hosts: string[]): APIActionRowComponent<APIButtonComponent> | null {
+function buttonRow(watch: Watch, hosts: string[], globs: string[] = []): APIActionRowComponent<APIButtonComponent> | null {
   const buttons: APIButtonComponent[] = [];
+  for (const glob of uniq(globs)) {
+    if (buttons.length >= DISCORD_LIMITS.buttonsPerRow) break;
+    const customId = `${IGNORE_PATH_PREFIX}${watch.id}:${glob}`;
+    if (customId.length > DISCORD_LIMITS.customId) continue;
+    buttons.push({
+      type: ComponentType.Button,
+      style: ButtonStyle.Secondary,
+      emoji: { name: '🚫' },
+      label: truncate(`Ignore ${glob}`, DISCORD_LIMITS.buttonLabel),
+      custom_id: customId,
+    });
+  }
   for (const host of uniq(hosts)) {
     if (buttons.length >= DISCORD_LIMITS.buttonsPerRow) break;
     const customId = `${WATCH_SUB_PREFIX}${watch.id}:${host}`;
@@ -867,15 +910,17 @@ function pack(watch: Watch, r: Rendered, footer: string, timestamp: string): Mes
   const payloads: MessagePayload[] = [];
   let embeds: APIEmbed[] = [];
   let hosts: string[] = [];
+  let globs: string[] = [];
   let total = 0;
   const flush = () => {
     if (!embeds.length) return;
     const p: MessagePayload = { embeds, allowedMentions: { parse: [] } };
-    const row = buttonRow(watch, hosts);
+    const row = buttonRow(watch, hosts, globs);
     if (row) p.components = [row];
     payloads.push(p);
     embeds = [];
     hosts = [];
+    globs = [];
     total = 0;
   };
   for (const block of r.blocks) {
@@ -885,6 +930,7 @@ function pack(watch: Watch, r: Rendered, footer: string, timestamp: string): Mes
     embeds.push(e);
     total += len;
     if (block.buttonHost) hosts.push(block.buttonHost);
+    if (block.ignoreGlobs) globs.push(...block.ignoreGlobs);
   }
   flush();
   const content = truncateMarkdown(r.content, CONTENT_BUDGET);

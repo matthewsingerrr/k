@@ -47,7 +47,7 @@ export const MAX_STORED_TEXT_CHARS = 500_000;
 /** Event summaries are capped at this many chars. */
 const MAX_EVENT_SUMMARY_CHARS = 4000;
 /** Current schema version (= number of migrations). */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 const BUILTIN_DEFAULTS: StoreDefaults = { intervalSec: 2, sweepSec: 120, maxPages: 150 };
 
@@ -171,12 +171,19 @@ const MIGRATIONS: Array<(db: Db) => void> = [
       UPDATE watches SET interval_sec = 2 WHERE interval_sec = 30;
     `);
   },
+  // v4: last build announced in each guild ("Ver 2.0 has been updated!")
+  (db) => {
+    const cols = new Set((db.prepare(`PRAGMA table_info(guild_settings)`).all() as Array<{ name: string }>).map((c) => c.name));
+    if (!cols.has('announced_version')) db.exec(`ALTER TABLE guild_settings ADD COLUMN announced_version TEXT`);
+  },
 ];
 
 export interface GuildSettings {
   guildId: string;
   panelChannelId: string | null;
   panelMessageId: string | null;
+  /** BUILD_ID of the last deploy announced in this guild. */
+  announcedVersion: string | null;
   updatedAt: number;
 }
 
@@ -478,25 +485,38 @@ export class Store {
   // --- guild settings (dashboard / backup message) ---------------------------
 
   getGuildSettings(guildId: string): GuildSettings | undefined {
-    const row = this.stmt(`SELECT guild_id, panel_channel_id, panel_message_id, updated_at FROM guild_settings WHERE guild_id = ?`).get(
-      String(guildId),
-    ) as { guild_id: string; panel_channel_id: string | null; panel_message_id: string | null; updated_at: number } | undefined;
+    const row = this.stmt(
+      `SELECT guild_id, panel_channel_id, panel_message_id, announced_version, updated_at FROM guild_settings WHERE guild_id = ?`,
+    ).get(String(guildId)) as
+      | { guild_id: string; panel_channel_id: string | null; panel_message_id: string | null; announced_version: string | null; updated_at: number }
+      | undefined;
     if (!row) return undefined;
-    return { guildId: row.guild_id, panelChannelId: row.panel_channel_id, panelMessageId: row.panel_message_id, updatedAt: row.updated_at };
+    return {
+      guildId: row.guild_id,
+      panelChannelId: row.panel_channel_id,
+      panelMessageId: row.panel_message_id,
+      announcedVersion: row.announced_version,
+      updatedAt: row.updated_at,
+    };
   }
 
-  setGuildSettings(guildId: string, patch: { panelChannelId?: string | null; panelMessageId?: string | null }): GuildSettings {
+  setGuildSettings(
+    guildId: string,
+    patch: { panelChannelId?: string | null; panelMessageId?: string | null; announcedVersion?: string | null },
+  ): GuildSettings {
     const cur = this.getGuildSettings(guildId);
     const next: GuildSettings = {
       guildId: String(guildId),
       panelChannelId: patch.panelChannelId !== undefined ? patch.panelChannelId : (cur?.panelChannelId ?? null),
       panelMessageId: patch.panelMessageId !== undefined ? patch.panelMessageId : (cur?.panelMessageId ?? null),
+      announcedVersion: patch.announcedVersion !== undefined ? patch.announcedVersion : (cur?.announcedVersion ?? null),
       updatedAt: Date.now(),
     };
     this.stmt(
-      `INSERT INTO guild_settings (guild_id, panel_channel_id, panel_message_id, updated_at) VALUES (@guildId, @panelChannelId, @panelMessageId, @updatedAt)
+      `INSERT INTO guild_settings (guild_id, panel_channel_id, panel_message_id, announced_version, updated_at)
+       VALUES (@guildId, @panelChannelId, @panelMessageId, @announcedVersion, @updatedAt)
        ON CONFLICT(guild_id) DO UPDATE SET panel_channel_id = excluded.panel_channel_id, panel_message_id = excluded.panel_message_id,
-         updated_at = excluded.updated_at`,
+         announced_version = excluded.announced_version, updated_at = excluded.updated_at`,
     ).run(next);
     return next;
   }

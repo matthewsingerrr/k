@@ -50,7 +50,7 @@ import type { Config } from '../config.js';
 import type { Store } from '../db/store.js';
 import type { BaselineSummary, Monitor } from '../monitor/scheduler.js';
 import type { AlertKind, Logger, Watch, WatchFeatures, WatchState } from '../types.js';
-import { isUnderDomain, normalizeUrl, parseWatchInput, urlPath } from '../extract/url.js';
+import { compileUrlPattern, isPathGlob, isUnderDomain, normalizeUrl, parseWatchInput, urlPath } from '../extract/url.js';
 import { ALERT_COLORS, WATCH_SUB_PREFIX, clampEmbed, codeSpan, escapeMarkdown, formatDuration, truncate } from './format.js';
 import type { PanelHost } from './panel.js';
 
@@ -491,14 +491,15 @@ export function validatePattern(pattern: string, kind: 'ignore' | 'exclude'): st
   if (p.length > MAX_PATTERN_CHARS) throw new UserError(`The pattern is too long (max ${MAX_PATTERN_CHARS} characters).`);
   let re: RegExp;
   try {
-    re = new RegExp(p, kind === 'ignore' ? 'gi' : 'i');
+    re = kind === 'exclude' && isPathGlob(p) ? (compileUrlPattern(p) as RegExp) : new RegExp(p, kind === 'ignore' ? 'gi' : 'i');
   } catch (err) {
     throw new UserError(`Invalid regex: ${errMessage(err).replace(/^Invalid regular expression: /, '')}`);
   }
-  if (hasNestedQuantifier(p)) {
+  const glob = kind === 'exclude' && isPathGlob(p); // globs compile to simple, linear regexes
+  if (!glob && hasNestedQuantifier(p)) {
     throw new UserError('That pattern has nested repetition like `(a+)+`, which can freeze the bot on some pages. Please simplify it.');
   }
-  if (!regexIsFast(p, re.flags)) {
+  if (!glob && !regexIsFast(p, re.flags)) {
     throw new UserError('That pattern is too slow on long pages (catastrophic backtracking). Please simplify it.');
   }
   if (kind === 'ignore') {

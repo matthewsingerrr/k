@@ -89,6 +89,7 @@ import {
   type ToggleKey,
 } from './commands.js';
 import { clampEmbed, codeSpan, escapeMarkdown, formatDuration, truncate } from './format.js';
+import { compileUrlPattern } from '../extract/url.js';
 
 /**
  * Implemented in src/discord/backup.ts (not by the panel): owns the ONE persistent panel message per guild
@@ -441,7 +442,7 @@ function rulesModal(w: Watch): APIModalInteractionResponseCallbackData {
     title: truncate(`Rules — ${w.name.replace(/[\r\n]+/g, ' ')}`, 45),
     components: [
       label('Ignore text (regex, one per line)', 'Matching text is removed before pages are compared, e.g. Last updated.*', listInput('ignore', w.ignorePatterns)),
-      label('Skip URLs (regex, one per line)', 'Matching URLs are never crawled or tracked, e.g. /blog/', listInput('exclude', w.excludePatterns)),
+      label('Skip URLs (one per line)', 'Never crawl/track/alert these, e.g. /profile/* or a regex', listInput('exclude', w.excludePatterns)),
       label('Extra pages (one per line)', 'Always tracked, even if nothing links to them — URLs or paths like /secret', listInput('extra', w.extraUrls)),
       label('Only crawl under this path', 'e.g. /docs — leave empty to crawl the whole site', textInput('scope', { value: w.scopePath ?? '', maxLength: MAX_SCOPE_CHARS, placeholder: '/docs' })),
       label('Max tracked pages', `1–${MAX_PAGES_LIMIT} · pages whose text is compared`, textInput('max_pages', { value: String(w.maxPages), required: true, maxLength: 4 })),
@@ -578,6 +579,35 @@ export async function handlePanelComponent(
           banner = paused ? `⏸️ Paused **${nameOf(w)}** — no checks until you resume it.` : `▶️ Resumed **${nameOf(w)}**.`;
         }
         await show(interaction, cardView(deps, current, interaction, banner), deps);
+        return;
+      }
+      case 'exclude': {
+        // "🚫 Ignore /folder/*" on a new-page alert (a public message): answer privately, never edit the alert.
+        requireManageGuild(interaction);
+        const pattern = validatePattern(parts.slice(3).join(':'), 'exclude');
+        const where = `**${nameOf(w)}**`;
+        if (w.excludePatterns.includes(pattern)) {
+          await respond(interaction, { content: `ℹ️ ${codeSpan(pattern, 100)} is already ignored on ${where}.` }, true, log);
+          return;
+        }
+        if (w.excludePatterns.length >= MAX_PATTERNS) throw new UserError(`${where} already has ${MAX_PATTERNS} skip rules — remove one in the dashboard (Rules) first.`);
+        const re = compileUrlPattern(pattern);
+        if (re?.test(w.url)) throw new UserError(`${codeSpan(pattern, 100)} would also skip the start page of ${where}.`);
+        const dropped = deps.store.listPages(w.id, { kind: 'page', tracked: true }).filter((r) => re?.test(r.url)).length;
+        const updated = deps.store.updateWatch(w.id, { excludePatterns: [...w.excludePatterns, pattern] });
+        notifyUpdated(deps, updated);
+        log.info('path ignored from alert button', { watchId: w.id, pattern, by: interaction.user.id });
+        await respond(
+          interaction,
+          {
+            content:
+              `🚫 Pages under ${codeSpan(pattern, 100)} on ${where} won't be announced or tracked anymore` +
+              (dropped ? ` (${dropped} tracked ${dropped === 1 ? 'page' : 'pages'} dropped)` : '') +
+              '. Undo it in the dashboard → **Rules**.',
+          },
+          true,
+          log,
+        );
         return;
       }
       case 'settings':
@@ -801,7 +831,7 @@ async function submitRules(i: ModalSubmitInteraction, deps: CommandDeps, w: Watc
     changes.push(plural(exclude.length, 'skipped URL pattern'));
     for (const p of exclude) {
       try {
-        if (!w.excludePatterns.includes(p) && new RegExp(p, 'i').test(w.url)) warnings.push(`⚠️ ${codeSpan(p, 100)} also matches the start URL.`);
+        if (!w.excludePatterns.includes(p) && compileUrlPattern(p)?.test(w.url)) warnings.push(`⚠️ ${codeSpan(p, 100)} also matches the start URL.`);
       } catch {
         // validated above
       }

@@ -83,6 +83,14 @@ Slash commands for quick use (Manage Server only):
 
 Subdomain alerts have a **Watch <host>** button that starts watching that subdomain as its own site.
 
+**Too many new-page alerts from one section** (user profiles, listings, etc.)? New-page alerts come with a **🚫 Ignore /profile/\*** button. One click stops announcing and tracking everything under that folder. You can also add skip rules yourself in the dashboard → **Rules**:
+- `/profile/*` skips everything under `/profile/` (but not `/profile` itself).
+- `/u/*/posts` uses `*` to stand for one path segment.
+- `/blog/**` skips everything below `/blog/`.
+- Anything else is treated as a regex matched against the full URL.
+
+**Update announcements:** after each deploy of new code, the bot posts "🚀 **Ver 2.0 has been updated!** Enjoy 🎉" (with the commit message) in the dashboard channel. It posts this once per build. Set `ANNOUNCE_UPDATES=false` to turn it off.
+
 ### How fast is "instant"?
 
 - **Homepage, redeploys and uptime:** checked every `interval` seconds (default **2**, minimum 1). A DOWN alert needs 3 failed checks spanning at least 20 seconds, so one slow response doesn't page anyone.
@@ -113,6 +121,7 @@ Subdomain alerts have a **Watch <host>** button that starts watching that subdom
 | `REQUEST_TIMEOUT_MS` | 20000 | |
 | `USER_AGENT` | recent desktop Chrome | |
 | `LOG_LEVEL` | info | debug / info / warn / error |
+| `ANNOUNCE_UPDATES` | true | Post "Ver X has been updated!" after a deploy |
 | `PORT` | 3000 (Railway sets it) | `/health` endpoint |
 
 ## Local development

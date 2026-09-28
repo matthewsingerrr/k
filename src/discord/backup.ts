@@ -17,7 +17,8 @@ import type { Config } from '../config.js';
 import type { Store } from '../db/store.js';
 import type { Monitor } from '../monitor/scheduler.js';
 import type { Logger, Watch, WatchFeatures } from '../types.js';
-import { buildPanelMessage, type PanelHost, type PanelMessage } from './panel.js';
+import { buildPanelMessage, PANEL_COLOR, type PanelHost, type PanelMessage } from './panel.js';
+import { BUILD_ID, COMMIT_MESSAGE, COMMIT_SHORT, DISPLAY_VERSION, APP_VERSION } from '../version.js';
 
 export const BACKUP_FILENAME = 'site-watcher-backup.json';
 const BACKUP_VERSION = 1;
@@ -55,14 +56,17 @@ export interface BackupFile {
   version: number;
   guildId: string;
   exportedAt: string;
+  /** BUILD_ID last announced in the guild, so a fresh container doesn't re-announce the same deploy. */
+  announcedVersion?: string | null;
   watches: BackupWatch[];
 }
 
-export function toBackup(guildId: string, watches: Watch[], now = new Date()): BackupFile {
+export function toBackup(guildId: string, watches: Watch[], now = new Date(), announcedVersion: string | null = null): BackupFile {
   return {
     version: BACKUP_VERSION,
     guildId,
     exportedAt: now.toISOString(),
+    announcedVersion,
     watches: watches.map((w) => ({
       name: w.name,
       url: w.url,
@@ -127,7 +131,13 @@ export function parseBackup(text: string): BackupFile | null {
       createdAt: typeof w.createdAt === 'number' ? w.createdAt : Date.now(),
     });
   }
-  return { version: r.version, guildId: str(r.guildId) ? r.guildId : '', exportedAt: str(r.exportedAt) ? r.exportedAt : '', watches };
+  return {
+    version: r.version,
+    guildId: str(r.guildId) ? r.guildId : '',
+    exportedAt: str(r.exportedAt) ? r.exportedAt : '',
+    announcedVersion: str(r.announcedVersion) ? r.announcedVersion : null,
+    watches,
+  };
 }
 
 function sha1(s: string): string {
@@ -175,7 +185,12 @@ export class PanelManager implements PanelHost {
   /** Call once the Discord client is ready: restore missing guilds, then keep dashboards in sync. */
   async start(): Promise<void> {
     this.unsubscribe = this.deps.store.onWatchesChanged((guildId) => this.schedule(guildId, false));
-    for (const guild of this.deps.client.guilds.cache.values()) await this.ensureRestored(guild);
+    for (const guild of this.deps.client.guilds.cache.values()) {
+      await this.ensureRestored(guild);
+      await this.announceUpdate(guild.id).catch((err) =>
+        this.deps.log.warn('update announcement failed', { guildId: guild.id, err: String(err) }),
+      );
+    }
     this.periodic = setInterval(() => {
       for (const guild of this.deps.client.guilds.cache.values()) {
         if (this.deps.store.getGuildSettings(guild.id)?.panelMessageId) this.schedule(guild.id, false);
@@ -260,7 +275,7 @@ export class PanelManager implements PanelHost {
 
   private restore(guildId: string, channelId: string, messageId: string, backup: BackupFile): void {
     const { store, config, log } = this.deps;
-    store.setGuildSettings(guildId, { panelChannelId: channelId, panelMessageId: messageId });
+    store.setGuildSettings(guildId, { panelChannelId: channelId, panelMessageId: messageId, announcedVersion: backup.announcedVersion ?? null });
     let restored = 0;
     for (const b of backup.watches) {
       if (store.findWatchByUrl(guildId, b.url)) continue;
@@ -393,9 +408,53 @@ export class PanelManager implements PanelHost {
   }
 
   private backupFile(guildId: string): { json: string; hash: string } {
-    const backup = toBackup(guildId, this.deps.store.listWatches(guildId));
+    const announced = this.deps.store.getGuildSettings(guildId)?.announcedVersion ?? null;
+    const backup = toBackup(guildId, this.deps.store.listWatches(guildId), new Date(), announced);
     const json = JSON.stringify(backup, null, 2);
-    return { json, hash: sha1(JSON.stringify(backup.watches)) };
+    return { json, hash: sha1(JSON.stringify([backup.announcedVersion, backup.watches])) };
+  }
+
+  /**
+   * After a deploy of new code: "🚀 Ver 2.0 has been updated! Enjoy 🎉" in the dashboard channel (or the first alert channel).
+   * Only for servers that already use the bot (a dashboard or at least one site) and only once per build — the build id is
+   * stored in the database and in the Discord backup, so restarts and fresh containers don't repeat it.
+   */
+  async announceUpdate(guildId: string): Promise<boolean> {
+    const { store, config, log } = this.deps;
+    const settings = store.getGuildSettings(guildId);
+    const watches = store.listWatches(guildId);
+    if (settings?.announcedVersion === BUILD_ID) return false;
+    const record = () => {
+      store.setGuildSettings(guildId, { announcedVersion: BUILD_ID });
+      this.schedule(guildId, false); // carry the new marker into the backup
+    };
+    if (!config.announceUpdates || (!settings?.panelMessageId && watches.length === 0)) {
+      if (settings || watches.length) record();
+      return false;
+    }
+    const candidates = [settings?.panelChannelId, ...watches.map((w) => w.channelId)].filter((c): c is string => !!c);
+    for (const channelId of [...new Set(candidates)]) {
+      const channel = await this.sendableChannel(channelId);
+      if (!channel) continue;
+      const lines = [`**Site Watcher v${APP_VERSION}** is live and watching **${watches.length}** ${watches.length === 1 ? 'site' : 'sites'}.`];
+      if (COMMIT_MESSAGE) lines.push('', `**What's new:** ${COMMIT_MESSAGE}`);
+      await channel.send({
+        content: `🚀 **Ver ${DISPLAY_VERSION} has been updated!** Enjoy 🎉`,
+        embeds: [
+          {
+            color: PANEL_COLOR,
+            description: lines.join('\n'),
+            footer: { text: COMMIT_SHORT ? `build ${COMMIT_SHORT}` : `v${APP_VERSION}` },
+            timestamp: new Date().toISOString(),
+          },
+        ],
+        allowedMentions: { parse: [] },
+      });
+      record();
+      log.info('announced update', { guildId, build: BUILD_ID });
+      return true;
+    }
+    return false;
   }
 
   private async post(guildId: string, channel: Sendable): Promise<Message> {

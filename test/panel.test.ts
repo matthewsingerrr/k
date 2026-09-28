@@ -832,3 +832,29 @@ describe('add site modal', () => {
     expect(textOf(last(f.calls))).toContain('no longer valid');
   });
 });
+
+describe('ignore-path button on new-page alerts', () => {
+  it('adds a /folder/* skip rule, drops matching tracked pages and answers privately', async () => {
+    const w = makeWatch('https://usepaid.app/');
+    store.upsertPage(page(w.id, 'https://usepaid.app/profile/teslaaibot'));
+    store.upsertPage(page(w.id, 'https://usepaid.app/docs'));
+    const f = await click(`panel:exclude:${w.id}:/profile/*`, { ephemeral: false });
+    const reply = last(f.calls);
+    expect(reply.type).toBe('reply');
+    expect(isEphemeral(reply)).toBe(true);
+    expect(textOf(reply)).toContain('/profile/*');
+    expect(textOf(reply)).toContain('1 tracked page dropped');
+    expect(store.getWatch(w.id)?.excludePatterns).toEqual(['/profile/*']);
+    expect(mon.calls.updated.at(-1)?.excludePatterns).toEqual(['/profile/*']);
+    // Second click is a no-op.
+    const again = await click(`panel:exclude:${w.id}:/profile/*`, { ephemeral: false });
+    expect(textOf(last(again.calls))).toContain('already ignored');
+    expect(store.getWatch(w.id)?.excludePatterns).toEqual(['/profile/*']);
+  });
+
+  it('requires Manage Server', async () => {
+    const w = makeWatch('https://usepaid.app/');
+    await click(`panel:exclude:${w.id}:/profile/*`, { manage: false, ephemeral: false });
+    expect(store.getWatch(w.id)?.excludePatterns).toEqual([]);
+  });
+});

@@ -17,7 +17,7 @@ import type { FetchResult } from '../net/http.js';
 import { mapLimit } from '../net/limiter.js';
 import { looksLikeHtml, parseHtml, type ParsedPage } from '../extract/html.js';
 import { discoverSitemap } from '../extract/sitemap.js';
-import { classifyUrl, inScope, isUnderDomain, MAX_SCOPED_URL_CHARS, normalizeUrl } from '../extract/url.js';
+import { classifyUrl, compileUrlPattern, inScope, isUnderDomain, MAX_SCOPED_URL_CHARS, normalizeUrl } from '../extract/url.js';
 import { maskNumbers, PatternTimeoutError } from '../diff/text.js';
 import type { Store } from '../db/store.js';
 import type {
@@ -521,11 +521,8 @@ class PagesPass {
     this.excludeRes = [];
     for (const src of Array.isArray(this.watch.excludePatterns) ? this.watch.excludePatterns : []) {
       if (typeof src !== 'string' || !src) continue;
-      try {
-        this.excludeRes.push(new RegExp(src, 'i'));
-      } catch {
-        // invalid user regex: ignored (inScope does the same)
-      }
+      const re = compileUrlPattern(src);
+      if (re) this.excludeRes.push(re); // invalid user regex: ignored (inScope does the same)
     }
   }
 

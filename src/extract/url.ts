@@ -217,12 +217,52 @@ const regexCache = new Map<string, RegExp | null>();
 const REGEX_CACHE_MAX = 1000;
 
 /** Compile a user-supplied exclude pattern (flag "i"); null if invalid. Cached. */
+/**
+ * A path glob like "/profile/*" or "/blog/**" (starts with "/", contains "*", only URL path characters, no regex ".*").
+ * Anything else is treated as a regular expression.
+ */
+export function isPathGlob(source: string): boolean {
+  return typeof source === 'string' && source.startsWith('/') && source.includes('*') && !source.includes('.*') && /^[A-Za-z0-9\-._~%!$&'()+,;=:@\/*]+$/.test(source);
+}
+
+/**
+ * Compile a user URL pattern (exclude rule). Path globs match the URL's path: "*" = one path segment (or part of one),
+ * "**" = anything, and a trailing "/*" covers everything below that folder at any depth ("/profile/*" matches
+ * "/profile/alice" and "/profile/alice/posts", but not "/profile" itself). Other patterns are case-insensitive regexes
+ * tested against the full URL. Invalid regexes → null.
+ */
+export function compileUrlPattern(source: string): RegExp | null {
+  if (typeof source !== 'string' || !source) return null;
+  if (isPathGlob(source)) {
+    let glob = source;
+    let tail = '';
+    if (glob.endsWith('/*') && !glob.endsWith('/**')) {
+      glob = glob.slice(0, -2);
+      tail = '/.+';
+    }
+    const body = glob
+      .split(/(\*\*|\*)/)
+      .map((part) => (part === '**' ? '.*' : part === '*' ? '[^/]*' : part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+      .join('');
+    try {
+      return new RegExp(`^[a-z][a-z0-9+.-]*://[^/?#]+${body}${tail}/?(?:[?#].*)?$`, 'i');
+    } catch {
+      return null;
+    }
+  }
+  try {
+    return new RegExp(source, 'i');
+  } catch {
+    return null;
+  }
+}
+
 function compileExclude(source: string): RegExp | null {
   const cached = regexCache.get(source);
   if (cached !== undefined) return cached;
   let re: RegExp | null = null;
   try {
-    re = source ? new RegExp(source, 'i') : null;
+    re = source ? compileUrlPattern(source) : null;
   } catch {
     re = null;
   }
@@ -245,7 +285,8 @@ function normalizeScopePath(scopePath: string | null | undefined): string | null
  * Whether a normalized URL belongs to a watch's crawl scope:
  * same hostname as watch.host (exact, case-insensitive; port must also match the start URL's port if any),
  * pathname starts with watch.scopePath when set (prefix at a segment boundary: "/docs" matches "/docs" and "/docs/x" not "/docsx"),
- * and no watch.excludePatterns regex (flags "i") matches the full URL. Invalid regexes are ignored.
+ * and no watch.excludePatterns rule matches (a path glob like "/profile/*", or a regex tested on the full URL; see
+ * compileUrlPattern). Invalid regexes are ignored.
  * URLs with a query string are in scope only if `allowQuery` is true (default false) — avoids infinite crawl spaces.
  *
  * Ports are compared exactly as URL reports them ("" for the scheme default), so a watch on http://127.0.0.1:8080/ only
