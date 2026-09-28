@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en" dir="ltr" class="docs-wrapper plugin-docs">
+<head>
+<meta charset="UTF-8">
+<meta name="generator" content="Docusaurus v3.5.2">
+<title data-rh="true">Staking | Acme Docs</title>
+<meta data-rh="true" name="description" content="How staking works on Acme.">
+<meta data-rh="true" property="og:description" content="OG fallback description">
+<link data-rh="true" rel="canonical" href="https://docs.acme.finance/staking">
+<link rel="stylesheet" href="/assets/css/styles.4d3f2a1b.css">
+<script src="/assets/js/runtime~main.8a7b6c5d.js" defer="defer"></script>
+<script src="/assets/js/main.1e2f3a4b.js" defer="defer"></script>
+</head>
+<body class="navigation-with-keyboard">
+<svg xmlns="http://www.w3.org/2000/svg" style="display: none;"><defs><symbol id="theme-svg-external-link"><title>External link</title><path d="M0 0"></path></symbol></defs></svg>
+<div id="__docusaurus"><div role="region" aria-label="Skip to main content"><a class="skipToContent" href="#__docusaurus_skipToContent_fallback">Skip to main content</a></div>
+<nav aria-label="Main" class="navbar"><div class="navbar__inner"><div class="navbar__items"><a class="navbar__brand" href="/"><b class="navbar__title">Acme Docs</b></a><a class="navbar__item" href="/intro">Guides</a><a class="navbar__item" href="/api">API</a></div><div class="navbar__items navbar__items--right"><a href="https://github.com/acme/docs" target="_blank" rel="noopener noreferrer" class="navbar__item">GitHub<svg width="13.5" height="13.5" aria-hidden="true"><use href="#theme-svg-external-link"></use></svg></a></div></div></nav>
+<div class="main-wrapper"><aside class="theme-doc-sidebar-container"><nav aria-label="Docs sidebar" class="menu"><ul class="menu__list"><li class="menu__list-item"><a class="menu__link" href="/intro">Introduction</a></li><li class="menu__list-item"><div class="menu__list-item-collapsible"><a class="menu__link menu__link--sublist" href="/staking">Staking</a><button aria-label="Toggle the collapsible sidebar category" type="button" class="clean-btn"></button></div><ul class="menu__list"><li class="menu__list-item"><a class="menu__link menu__link--active" aria-current="page" href="/staking">Overview</a></li><li class="menu__list-item"><a class="menu__link" href="/staking/rewards">Rewards</a></li></ul></li></ul></nav></aside>
+<main class="docMainContainer"><div class="container"><nav class="theme-doc-breadcrumbs" aria-label="Breadcrumbs"><ul class="breadcrumbs"><li class="breadcrumbs__item"><a class="breadcrumbs__link" href="/">Home</a></li><li class="breadcrumbs__item"><span class="breadcrumbs__link">Staking</span></li></ul></nav>
+<article><div class="theme-doc-markdown markdown"><header><h1>Staking</h1></header>
+<p>Stake <code>ACME</code> to earn a share of protocol fees. Rewards are paid every <strong>epoch</strong> (about 2 days).</p>
+<h2 class="anchor" id="how-it-works">How it works<a href="#how-it-works" class="hash-link" aria-label="Direct link to How it works" title="Direct link to How it works">​</a></h2>
+<ol><li>Connect your wallet.</li><li>Choose an amount and click <em>Stake</em>.</li></ol>
+<div class="theme-admonition theme-admonition-warning alert alert--warning"><div class="admonitionHeading"><span class="admonitionIcon"><svg viewBox="0 0 16 16"><path d="M8.9 1.5"></path></svg></span>warning</div><div class="admonitionContent"><p>Unstaking takes 7 days.</p></div></div>
+<div class="language-ts codeBlockContainer"><div class="codeBlockContent"><pre tabindex="0" class="prism-code language-ts codeBlock"><code class="codeBlockLines"><span class="token-line"><span class="token keyword">const</span><span class="token plain"> stake </span><span class="token operator">=</span><span class="token plain"> </span><span class="token keyword">await</span><span class="token plain"> acme</span><span class="token punctuation">.</span><span class="token function">stake</span><span class="token punctuation">(</span><span class="token number">100</span><span class="token punctuation">)</span><br></span><span class="token-line"><span class="token plain">console</span><span class="token punctuation">.</span><span class="token function">log</span><span class="token punctuation">(</span><span class="token plain">stake</span><span class="token punctuation">)</span><br></span></code></pre><div class="buttonGroup"><button type="button" aria-label="Copy code to clipboard" title="Copy" class="clean-btn"><span class="copyButtonIcons" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M19"></path></svg></span></button></div></div></div>
+<table><thead><tr><th>Tier</th><th>APR</th></tr></thead><tbody><tr><td>Bronze</td><td>5%</td></tr><tr><td>Gold</td><td>9%</td></tr></tbody></table>
+<p>Prices: <span class="price"><span class="cur">$</span><span class="amt">10</span></span> per month.</p>
+</div></article>
+<nav class="pagination-nav docusaurus-mt-lg" aria-label="Docs pages"><a class="pagination-nav__link pagination-nav__link--prev" href="/intro"><div class="pagination-nav__sublabel">Previous</div><div class="pagination-nav__label">Introduction</div></a><a class="pagination-nav__link pagination-nav__link--next" href="/staking/rewards"><div class="pagination-nav__sublabel">Next</div><div class="pagination-nav__label">Rewards</div></a></nav>
+</div></main></div>
+<footer class="footer"><div class="footer__copyright">Copyright © 2026 Acme. Built with Docusaurus.</div></footer></div>
+</body>
+</html>

@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head><title>Hidden things</title><style>.x{color:red}</style><script>var secret = "SCRIPT_TEXT";</script></head>
+<body>
+<h1>Visible heading</h1>
+<p>Visible paragraph</p>
+<div hidden>HIDDEN_ATTR</div>
+<div hidden="until-found">HIDDEN_UNTIL_FOUND</div>
+<div aria-hidden="true">ARIA_HIDDEN <span>ARIA_CHILD</span></div>
+<div aria-hidden="false">Aria false is visible</div>
+<div style="display:none">DISPLAY_NONE</div>
+<div style="color: red; DISPLAY : NONE !important">DISPLAY_NONE_IMPORTANT</div>
+<div style="display:none;color:red">DISPLAY_NONE_FIRST</div>
+<div style="display: block">Display block is visible</div>
+<div style="display:none-ish">Weird display value is visible</div>
+<div style="visibility:hidden">Visibility hidden is kept</div>
+<noscript>NOSCRIPT_TEXT <a href="/noscript-link">ns</a></noscript>
+<template><p>TEMPLATE_TEXT</p></template>
+<svg><text>SVG_TEXT</text><title>SVG_TITLE</title></svg>
+<canvas>CANVAS_FALLBACK</canvas>
+<iframe src="/frame">IFRAME_FALLBACK</iframe>
+<object data="/x.swf">OBJECT_FALLBACK</object>
+<!-- COMMENT_TEXT -->
+<script type="application/ld+json">{"@context":"https://schema.org","name":"LD_JSON_TEXT"}</script>
+<style>body{content:"STYLE_TEXT"}</style>
+<title>404: This page could not be found.</title>
+<select><option>Option A</option><option>Option B</option></select>
+<button>Click me</button><label>Label text</label>
+<p>Zero&#8203;width and non&nbsp;breaking   spaces</p>
+<section><div><span style="display:none">NESTED_HIDDEN</span>Nested visible</div></section>
+</body>
+</html>
