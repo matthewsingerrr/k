@@ -89,6 +89,16 @@ Subdomain alerts have a **Watch <host>** button that starts watching that subdom
 - `/blog/**` skips everything below `/blog/`.
 - Anything else is treated as a regex matched against the full URL.
 
+**API tracking:** when a site's code calls its own JSON API (e.g. `/api/launches/count`), the bot finds those endpoints and starts tracking them. It posts a one-time "🔌 Now tracking…" note. After that, any change in what the API returns is posted as a diff, like `- "status": "live"` / `+ "status": "paused"`. You can add any other endpoint yourself in the dashboard → **Rules → extra pages**. API routes added in a redeploy show up as new pages.
+
+**Sites that block bots:** some sites (Vercel or Cloudflare bot protection) challenge traffic from cloud servers like Railway. When that happens:
+- The bot posts one 🛡️ note.
+- It stops crawling that site and checks only its homepage once a minute.
+- The site shows 🛡️ on the dashboard.
+- Subdomain alerts keep working, because they come from certificate logs and DNS rather than from the site itself.
+
+When the site lets the bot back in, it says so and returns to normal speed. The bot does not try to get around the challenge.
+
 **Update announcements:** after each deploy of new code, the bot posts "🚀 **Ver 2.0 has been updated!** Enjoy 🎉" (with the commit message) in the dashboard channel. It posts this once per build. Set `ANNOUNCE_UPDATES=false` to turn it off.
 
 ### How fast is "instant"?

@@ -16,6 +16,7 @@
 import type { FetchResult } from '../net/http.js';
 import { mapLimit } from '../net/limiter.js';
 import { looksLikeHtml, parseHtml, type ParsedPage } from '../extract/html.js';
+import { jsonAsPage, looksLikeJson } from '../extract/json.js';
 import { discoverSitemap } from '../extract/sitemap.js';
 import { classifyUrl, compileUrlPattern, inScope, isUnderDomain, MAX_SCOPED_URL_CHARS, normalizeUrl } from '../extract/url.js';
 import { maskNumbers, PatternTimeoutError } from '../diff/text.js';
@@ -367,12 +368,23 @@ function safeLog(ctx: CheckContext, level: 'debug' | 'info' | 'warn' | 'error', 
   }
 }
 
+/** HTML pages, and JSON API responses (diffed as canonical, key-sorted JSON lines). */
 function isHtmlResponse(res: FetchResult): boolean {
-  return typeof res.bodyText === 'string' && looksLikeHtml(res.contentType, res.bodyText);
+  return typeof res.bodyText === 'string' && (looksLikeHtml(res.contentType, res.bodyText) || looksLikeJson(res.contentType, res.bodyText));
 }
 
 function isLiveHtml(res: FetchResult | null): res is FetchResult & { bodyText: string } {
   return !!res && res.ok && !res.blocked && !res.notModified && isHtmlResponse(res);
+}
+
+const EMPTY_JSON_PAGE = jsonAsPage('null') as ParsedPage;
+
+/** Parse a readable response: JSON bodies become a link-less "page" of JSON lines, everything else goes through parseHtml. */
+function parseBody(bodyText: string, contentType: string | null, url: string): ParsedPage {
+  if (!looksLikeHtml(contentType, bodyText) && looksLikeJson(contentType, bodyText)) {
+    return jsonAsPage(bodyText) ?? { ...EMPTY_JSON_PAGE, textLines: [] };
+  }
+  return parseHtml(bodyText, url);
 }
 
 function isHtmlType(contentType: string | null): boolean {
@@ -637,7 +649,8 @@ class PagesPass {
         if (!page.tracked) this.promote(page);
         continue;
       }
-      const kind: PageKind = url !== this.startUrl && classifyUrl(url) === 'file' ? 'file' : 'page';
+      // Extra URLs ending in .json are API endpoints: diffed like pages rather than hashed like files.
+      const kind: PageKind = url !== this.startUrl && classifyUrl(url) === 'file' && !/\.json(?:$|\?)/i.test(url) ? 'file' : 'page';
       if (this.known.has(url)) {
         // Known but not a page row → a file row.
         const rec = this.ctx.store.getPage(this.watch.id, url);
@@ -811,7 +824,7 @@ class PagesPass {
     if (res.contentType) rec.contentType = res.contentType;
     if (!isHtmlResponse(res)) return null;
 
-    const parsed = parsedIn ?? parseHtml(res.bodyText as string, res.finalUrl || rec.url);
+    const parsed = parsedIn ?? parseBody(res.bodyText as string, res.contentType, res.finalUrl || rec.url);
     // A page seen for the first time (just seeded or promoted, or never served content yet — e.g. blocked at the baseline)
     // has no "before" to compare its links against: they are old news. (Not the stored text hash: with text checks off,
     // or after an ignore-pattern change, pages have none but their links were collected all along.)
@@ -1025,7 +1038,7 @@ class PagesPass {
       safeLog(this.ctx, 'debug', 'confirm fetch inconclusive', { url: rec.url, status: res?.status ?? 0 });
       return;
     }
-    const parsed = parseHtml(res.bodyText, res.finalUrl || rec.url);
+    const parsed = parseBody(res.bodyText, res.contentType, res.finalUrl || rec.url);
     const snapshot = snapshotOf(parsed);
     if (snapshot === '' && rec.text) return;
     const { cmp, hash } = compareHash(snapshot, job.settings);
@@ -1456,7 +1469,7 @@ class PagesPass {
           this.saveKnown(c, REDIRECT_STATUS, res);
         }
         if (!this.known.has(final)) {
-          const parsed = parseHtml(res.bodyText as string, res.finalUrl);
+          const parsed = parseBody(res.bodyText as string, res.contentType, res.finalUrl);
           this.recordLive(final, { url: final, depth: c.depth, source: 'redirect', announce: c.announce }, res, parsed);
         }
         return;
@@ -1471,7 +1484,7 @@ class PagesPass {
     }
 
     if (live) {
-      const parsed = parseHtml(res.bodyText as string, res.finalUrl || c.url);
+      const parsed = parseBody(res.bodyText as string, res.contentType, res.finalUrl || c.url);
       this.recordLive(c.url, c, res, parsed);
       return;
     }

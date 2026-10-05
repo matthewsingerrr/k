@@ -20,6 +20,25 @@ export const BLOCKED_REALERT_MS = 6 * 3600_000;
 
 /** In-memory (per scheduler WatchState object) time of the last blocked / rate-limited info alert. */
 const lastBlockedAlert = new WeakMap<WatchState, number>();
+/** A "blocked" note was actually posted for the current episode → post a "reachable again" note when it ends. */
+const blockedAnnounced = new WeakSet<WatchState>();
+
+/** While a site keeps challenging/rate-limiting the watcher, its homepage is only probed this often. */
+export const BLOCKED_PROBE_MS = 60_000;
+
+/** True while the watch is in a bot-challenge or rate-limit episode (checks back off to BLOCKED_PROBE_MS). */
+export function isWalledOff(state: Pick<WatchState, 'status'> | null | undefined): boolean {
+  const st = state?.status;
+  return !!st && ((st.consecutiveBlocked ?? 0) >= BLOCKED_AFTER || (st.consecutiveRateLimited ?? 0) >= BLOCKED_AFTER);
+}
+
+function protectionName(res: FetchResult): string {
+  const h = res.headers ?? {};
+  if (h['cf-ray'] || h['cf-mitigated'] || /cloudflare/i.test(h['server'] ?? '')) return 'Cloudflare';
+  if (h['x-vercel-id'] || h['x-vercel-mitigated'] || /vercel/i.test(h['server'] ?? '')) return 'Vercel';
+  if (h['x-amzn-waf-action']) return 'AWS WAF';
+  return 'bot protection';
+}
 const lastRateLimitAlert = new WeakMap<WatchState, number>();
 
 /** Human-readable failure detail for a FetchResult ("HTTP 503", "timeout after 20s", "ECONNREFUSED"). */
@@ -78,15 +97,25 @@ export function updateStatus(ctx: CheckContext, home: FetchResult): Array<Status
       const last = lastBlockedAlert.get(state);
       if (last === undefined || now - last >= BLOCKED_REALERT_MS) {
         lastBlockedAlert.set(state, now);
+        blockedAnnounced.add(state);
+        const every = Math.max(watch.intervalSec, BLOCKED_PROBE_MS / 1000);
         alerts.push({
           kind: 'info',
-          message: `⚠️ ${watch.host} is showing a bot challenge (Cloudflare/captcha) to the watcher — changes may be missed.`,
+          message:
+            `🛡️ ${watch.host} is blocking the watcher with its ${protectionName(home)} bot check, so page, deploy and API checks are paused. ` +
+            `Checking once every ${every >= 60 ? `${Math.round(every / 60)} min` : `${every}s`} until it lets the bot back in; subdomain alerts keep working.`,
         });
       }
     }
     return alerts;
   }
 
+  if (blockedAnnounced.has(state) && st.consecutiveBlocked > 0) {
+    blockedAnnounced.delete(state);
+    if (canAlert) {
+      alerts.push({ kind: 'info', message: `✅ ${watch.host} is letting the watcher in again — back to checking every ${watch.intervalSec}s.` });
+    }
+  }
   st.consecutiveBlocked = 0;
   st.alertedBlocked = false;
 

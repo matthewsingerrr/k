@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  isWalledOff,
   BLOCKED_AFTER,
   BLOCKED_REALERT_MS,
   DOWN_AFTER_FAILURES,
@@ -142,18 +143,20 @@ describe('updateStatus: bot challenge', () => {
     expect(tick(h, blocked())).toEqual([]);
     expect(tick(h, blocked())).toEqual([]);
     const alerts = tick(h, blocked());
-    expect(alerts).toEqual([
-      {
-        kind: 'info',
-        message: '⚠️ unpeg.io is showing a bot challenge (Cloudflare/captcha) to the watcher — changes may be missed.',
-      },
-    ]);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0].kind).toBe('info');
+    expect((alerts[0] as InfoAlert).message).toMatch(/^🛡️ unpeg\.io is blocking the watcher .*subdomain alerts keep working\.$/);
     expect(st).toMatchObject({ consecutiveBlocked: 3, alertedBlocked: true, up: true, consecutiveFailures: 0 });
+    expect(isWalledOff(h.ctx.state)).toBe(true);
     for (let i = 0; i < 5; i++) expect(tick(h, blocked())).toEqual([]);
 
-    // First unblocked fetch resets the blocked flags without an alert.
-    expect(tick(h, ok())).toEqual([]);
+    // First unblocked fetch resets the blocked flags and says so once.
+    const back = tick(h, ok());
+    expect(back).toHaveLength(1);
+    expect((back[0] as InfoAlert).message).toMatch(/letting the watcher in again/);
     expect(st).toMatchObject({ consecutiveBlocked: 0, alertedBlocked: false });
+    expect(isWalledOff(h.ctx.state)).toBe(false);
+    expect(tick(h, ok())).toEqual([]);
   });
 
   it('is neither up nor down: a challenge does not break or extend a failure streak', () => {
@@ -178,10 +181,11 @@ describe('updateStatus: bot challenge', () => {
       out.push(...tick(h, ok()));
       return out;
     };
-    expect(cycle()).toHaveLength(1);
+    // Blocked note + "letting the watcher in again"; then silence (both throttled together) until the re-alert window passes.
+    expect(cycle()).toHaveLength(2);
     for (let i = 0; i < 20; i++) expect(cycle()).toEqual([]);
     h.advance(BLOCKED_REALERT_MS);
-    expect(cycle()).toHaveLength(1);
+    expect(cycle()).toHaveLength(2);
   });
 
   it('allows the challenge info alert even with features.status off', () => {

@@ -859,7 +859,7 @@ describe('overlap, shutdown and first-baseline edge cases', () => {
     const infos = delivered.flat();
     expect(infos).toHaveLength(1);
     expect(infos[0]).toMatchObject({ kind: 'info' });
-    expect((infos[0] as { message: string }).message).toMatch(/bot challenge/);
+    expect((infos[0] as { message: string }).message).toMatch(/blocking the watcher/);
     expect(store.getWatch(watch.id)!.baselineDone).toBe(false);
 
     http.set('/', page('Acme', '<a href="/about">About</a>'));

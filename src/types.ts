@@ -161,6 +161,8 @@ export interface WatchState {
   lastError: string | null;
   /** When the (latest) silent baseline pass completed (ms epoch, 0 = never). Items first seen after this are "new". */
   baselineAt: number;
+  /** API paths from site code already probed for JSON (code intel → API tracking), newest last. */
+  apiProbed: string[];
   /** A Cert Spotter backlog is still being paged through (names from it are old → silent). Survives restarts. */
   ctBackfill: boolean;
   /** At least one Cert Spotter poll succeeded (tells "no certificates yet" from "never polled"). Survives restarts. */
@@ -207,6 +209,7 @@ export function defaultWatchState(): WatchState {
     lastChangeAt: 0,
     lastError: null,
     baselineAt: 0,
+    apiProbed: [],
     ctBackfill: false,
     ctPolledOk: false,
     subdomainsBaselined: false,

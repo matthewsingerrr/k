@@ -75,7 +75,8 @@ import { looksLikeHtml, parseHtml, type ParsedPage } from '../extract/html.js';
 import { isUnderDomain, normalizeUrl, urlFilename, urlPath } from '../extract/url.js';
 import type { Alert, AlertKind, Logger, Notifier, SubdomainSource, Watch, WatchFeatures, WatchState } from '../types.js';
 import type { CheckContext, HomeSnapshot } from './context.js';
-import { updateStatus } from './status.js';
+import { BLOCKED_PROBE_MS, isWalledOff, updateStatus } from './status.js';
+import { probeApiEndpoints } from './api.js';
 import { checkDeploy, type DeployCheckResult } from './deploy.js';
 import { checkPages, clearPageHashes, rehashPages, type PagesCheckResult } from './pages.js';
 import { checkFiles } from './files.js';
@@ -795,7 +796,11 @@ export class Monitor {
     } catch (err) {
       this.log.error('scheduled check failed', { watchId: entry.id, err: errText(err) });
     } finally {
-      if (this.isLive(entry, gen) && !entry.fastTimer) this.scheduleFast(entry, jittered(intervalMs(entry.watch)));
+      if (this.isLive(entry, gen) && !entry.fastTimer) {
+        // While the site walls us off (bot challenge / 429), probe politely instead of every interval.
+        const base = intervalMs(entry.watch);
+        this.scheduleFast(entry, jittered(isWalledOff(entry.state) ? Math.max(base, BLOCKED_PROBE_MS) : base));
+      }
     }
   }
 
@@ -1082,21 +1087,27 @@ export class Monitor {
     const snapshot: HomeSnapshot = { fetch: home, parsed: this.parseHome(home) };
     const status = await stage('status', () => updateStatus(ctx, home));
     if (status) alerts.push(...status);
+    // The site is challenging / rate-limiting us: every other request would be refused too, so don't send them.
+    const walled = !opts.baseline && (home.blocked || home.status === 429);
 
     let deploy: DeployCheckResult | null = null;
-    if (f.deploy || f.codeIntel) {
+    if ((f.deploy || f.codeIntel) && !walled) {
       deploy = await stage('deploy', () => checkDeploy(ctx, snapshot));
       if (deploy?.changed) full = true;
       if (deploy?.alert) alerts.push(deploy.alert);
     }
     let pages: PagesCheckResult | null = null;
-    if (f.text || f.pages || f.files) {
+    if ((f.text || f.pages || f.files) && !walled) {
       pages = await stage('pages', () => checkPages(ctx, { home: snapshot, full, extraPaths: deploy?.newCodePaths ?? [] }));
       if (pages) alerts.push(...pages.alerts);
     }
-    if (f.files) {
+    if (f.files && !walled) {
       const files = await stage('files', () => checkFiles(ctx, { full }));
       if (files) alerts.push(...files);
+    }
+    if (f.text && !walled) {
+      const api = await stage('api', () => probeApiEndpoints(ctx));
+      if (api) alerts.push(...api);
     }
     const localHosts = f.subdomains ? this.localHostsOf(entry, deploy, pages) : [];
 

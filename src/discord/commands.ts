@@ -49,6 +49,7 @@ import { parse as parseDomain } from 'tldts';
 import type { Config } from '../config.js';
 import type { Store } from '../db/store.js';
 import type { BaselineSummary, Monitor } from '../monitor/scheduler.js';
+import { isWalledOff } from '../monitor/status.js';
 import type { AlertKind, Logger, Watch, WatchFeatures, WatchState } from '../types.js';
 import { compileUrlPattern, isPathGlob, isUnderDomain, normalizeUrl, parseWatchInput, urlPath } from '../extract/url.js';
 import { ALERT_COLORS, WATCH_SUB_PREFIX, clampEmbed, codeSpan, escapeMarkdown, formatDuration, truncate } from './format.js';
@@ -908,6 +909,7 @@ export function siteStatus(w: Watch, state: Pick<WatchState, 'status'> | null | 
   if (w.paused) return { emoji: '⏸️', label: 'Paused', color: ALERT_COLORS.info };
   if (!w.baselineDone) return { emoji: '⏳', label: 'First scan pending', color: ALERT_COLORS.text };
   if (state && state.status && !state.status.up) return { emoji: '🔴', label: 'Down', color: ALERT_COLORS.statusDown };
+  if (isWalledOff(state)) return { emoji: '🛡️', label: 'Blocked by the site’s bot protection', color: ALERT_COLORS.text };
   return { emoji: '🟢', label: 'Up', color: ALERT_COLORS.statusUp };
 }
 

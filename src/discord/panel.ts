@@ -260,6 +260,7 @@ export function buildPanelMessage(
     const tally = [
       ['🟢', 'up'],
       ['🔴', 'down'],
+      ['🛡️', 'blocked'],
       ['⏸️', 'paused'],
       ['⏳', 'scanning'],
     ]
