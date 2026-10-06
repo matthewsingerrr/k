@@ -5,6 +5,7 @@
 
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  DEFAULT_DEV_DEMOTED_TOKEN,
   DEFAULT_DEV_OTHER_TOKEN,
   DEFAULT_DEV_TOKEN,
   DEV_CHANNELS,
@@ -70,5 +71,19 @@ describe('dev link server', () => {
     const other = s.watches.find((w) => w.guildId !== DEV_GUILD_ID)!;
     expect((await api(s, 'GET', `/watches/${other.id}`)).status).toBe(404);
     expect((await api(s, 'GET', '/ping', undefined, 'swb_' + 'x'.repeat(43))).status).toBe(401);
+
+    // #mod-logs is private: not offered, and refused as an alert channel.
+    r = await api(s, 'PATCH', `/watches/${fixture.id}`, { channelId: DEV_CHANNELS.modlogs });
+    expect(r.status).toBe(400);
+    expect(r.json.error).toMatchObject({ code: 'invalid_channel', field: 'channelId' });
+
+    // The demoted creator's token reads, but every management write is 403.
+    expect(s.demotedToken).toBe(DEFAULT_DEV_DEMOTED_TOKEN);
+    expect((await api(s, 'GET', `/watches/${fixture.id}`, undefined, s.demotedToken)).status).toBe(200);
+    r = await api(s, 'POST', `/watches/${fixture.id}/pause`, undefined, s.demotedToken);
+    expect(r.status).toBe(403);
+    expect(r.json.error.code).toBe('forbidden');
+    expect((await api(s, 'DELETE', `/watches/${fixture.id}`, undefined, s.demotedToken)).status).toBe(403);
+    expect(s.store.getWatch(fixture.id)?.paused).toBe(false);
   });
 });

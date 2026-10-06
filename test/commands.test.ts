@@ -23,6 +23,7 @@ import {
   REPLY_DEADLINE_MS,
   resolvePageUrl,
   validatePattern,
+  validateNewPatterns,
   type CommandDeps,
 } from '../src/discord/commands.js';
 import type { PanelHost } from '../src/discord/panel.js';
@@ -1103,5 +1104,21 @@ describe('helpers', () => {
     expect(resolvePageUrl('http://localhost:8080/a', w)).toBe('http://localhost:8080/a');
     expect(resolvePageUrl('mailto:a@b.c', w)).toBeNull();
     expect(resolvePageUrl('', w)).toBeNull();
+  });
+});
+
+describe('validateNewPatterns: one save has a bounded probe budget', () => {
+  it('refuses a list of slow-to-probe patterns quickly, keeps ordinary lists and known entries working', () => {
+    // Each passes alone (~150 ms of probing on its own), but 25 of them would block the event loop for seconds.
+    const slow = Array.from({ length: 25 }, (_, i) => ['b', 'c', 'd', 'e', 'f', 'g'].map((x) => `a*I${i}Q${x}`).join('|'));
+    const t0 = performance.now();
+    expect(() => validateNewPatterns(slow, [], 'ignore')).toThrow(/Too many new ignore patterns to check at once/);
+    expect(performance.now() - t0).toBeLessThan(1500);
+    const ordinary = Array.from({ length: 25 }, (_, i) => `Last updated ${i}.*`);
+    expect(() => validateNewPatterns(ordinary, [], 'ignore')).not.toThrow();
+    // entries already saved are not probed again
+    const t1 = performance.now();
+    expect(() => validateNewPatterns(slow, slow, 'ignore')).not.toThrow();
+    expect(performance.now() - t1).toBeLessThan(200);
   });
 });

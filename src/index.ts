@@ -8,7 +8,7 @@ import { Monitor } from './monitor/scheduler.js';
 import { startBot } from './discord/bot.js';
 import { PanelManager } from './discord/backup.js';
 import { guildSnapshot } from './discord/guild-info.js';
-import { Events } from 'discord.js';
+import { Events, PermissionFlagsBits, type GuildMember } from 'discord.js';
 import { startHealthServer, type HttpRouteHandler } from './health.js';
 import { createDnsProvider } from './net/dns.js';
 import { createCtProvider } from './monitor/subdomains.js';
@@ -90,6 +90,29 @@ async function main(): Promise<void> {
       isRestoring: () => panels?.restoring() ?? true,
       // Channels and roles for management writes and GET /guild: the gateway cache only (null until Discord is ready).
       guildInfo: (guildId) => (bot.isReady() ? guildSnapshot(bot.client.guilds.cache.get(guildId)) : null),
+      // The token creator's rights now: Manage Server (management writes) and the channels they can see (alert channel
+      // choices). GET /guilds/:id/members/:user is REST and needs no GuildMembers intent; force skips the stale cache.
+      creatorAccess: async (guildId, userId) => {
+        if (!bot.isReady()) return null;
+        const g = bot.client.guilds.cache.get(guildId);
+        const none = { manager: false, viewable: new Set<string>() };
+        if (!g || !/^\d{5,25}$/.test(userId)) return none;
+        let m: GuildMember;
+        try {
+          m = await g.members.fetch({ user: userId, force: true });
+        } catch (err) {
+          return (err as { code?: unknown } | null)?.code === 10007 ? none : null; // 10007 Unknown Member: left/kicked/banned
+        }
+        const viewable = new Set<string>();
+        for (const c of g.channels.cache.values()) {
+          try {
+            if (c.permissionsFor(m)?.has(PermissionFlagsBits.ViewChannel)) viewable.add(c.id);
+          } catch {
+            // a channel Discord can't resolve permissions for is not offered
+          }
+        }
+        return { manager: g.ownerId === userId || m.permissions.has(PermissionFlagsBits.ManageGuild), viewable };
+      },
       announce: async (channelId, content) => {
         try {
           if (!bot.isReady()) {

@@ -18,10 +18,13 @@
  *   + one watch per URL in DEV_SEED_URLS (comma-separated; real network crawls).
  * - "Other Server" (guild 1380000000000000000) with its own token (DEV_OTHER_TOKEN) and one paused watch, for
  *   cross-server checks (its watch id is a 404 with the Dev Server token).
+ * - A second Dev Server token (DEV_DEMOTED_TOKEN) whose creator has lost Manage Server: reads work, management writes get
+ *   403 forbidden. Every Dev Server token's creator can't see #mod-logs (private): GET /guild leaves it out and it is
+ *   refused as an alert channel (invalid_channel).
  *
  * The fixture site: GET /__bump makes the next check see a redeploy, a text change on /about and a new page.
  *
- * Env: PORT (8721), DEV_SITE_PORT (PORT + 1), DEV_DB (:memory:), DEV_TOKEN, DEV_OTHER_TOKEN, DEV_SEED_URLS,
+ * Env: PORT (8721), DEV_SITE_PORT (PORT + 1), DEV_DB (:memory:), DEV_TOKEN, DEV_OTHER_TOKEN, DEV_DEMOTED_TOKEN, DEV_SEED_URLS,
  * DEV_ALLOW_PRIVATE=1 (the API accepts private / local targets, as with ALLOW_PRIVATE_NETWORK), DEV_REAL_NET=1 (real
  * Certificate Transparency and DNS lookups for subdomains; default: offline stubs), LOG_LEVEL (info).
  */
@@ -52,11 +55,15 @@ export const DEV_CHANNELS = {
   alerts: '1290000000000000002',
   announcements: '1290000000000000003',
   other: '1390000000000000001',
+  /** Private: no token creator can see it. */
+  modlogs: '1290000000000000004',
 } as const;
 export const DEV_ROLES = { alpha: '1280000000000000077', bots: '1280000000000000078', other: '1380000000000000077' } as const;
 /** Fixed so the extension's tests can hard-code them; local use only ("swb_" + 43 URL-safe characters, like real ones). */
 export const DEFAULT_DEV_TOKEN = 'swb_dev-local-link-token-for-extension-tests000';
 export const DEFAULT_DEV_OTHER_TOKEN = 'swb_dev-other-server-token-for-isolation-test00';
+/** Dev Server token whose creator ("dev-demoted") no longer has Manage Server. */
+export const DEFAULT_DEV_DEMOTED_TOKEN = 'swb_dev-demoted-creator-token-for-tests000000';
 
 export interface DevLinkServerOptions {
   /** API port (0 = any free port). */
@@ -67,6 +74,7 @@ export interface DevLinkServerOptions {
   db?: string;
   token?: string;
   otherToken?: string;
+  demotedToken?: string;
   /** Extra watches of real sites in the Dev Server. */
   seedUrls?: string[];
   /** The API accepts private / local targets (ALLOW_PRIVATE_NETWORK). */
@@ -85,6 +93,7 @@ export interface DevLinkServer {
   sitePort: number;
   token: string;
   otherToken: string;
+  demotedToken: string;
   watches: Array<{ id: number; guildId: string; name: string; url: string; paused: boolean }>;
   /** Discord notices the API sent ("➕ … was added from …"), in order. */
   announced: Array<{ channelId: string; content: string }>;
@@ -107,6 +116,7 @@ function devGuilds(): Record<string, GuildSnapshot> {
         { id: DEV_CHANNELS.scans, name: 'scans', type: 'text', category: 'MONITORING', canPost: true, missing: [] },
         { id: DEV_CHANNELS.alerts, name: 'alerts', type: 'text', category: 'MONITORING', canPost: true, missing: [] },
         { id: DEV_CHANNELS.announcements, name: 'announcements', type: 'announcement', category: null, canPost: false, missing: ['Send Messages'] },
+        { id: DEV_CHANNELS.modlogs, name: 'mod-logs', type: 'text', category: 'STAFF', canPost: true, missing: [] },
       ],
       roles: [
         { id: DEV_ROLES.bots, name: 'Site Watcher', everyone: false, managed: true, color: 0 },
@@ -314,7 +324,9 @@ export async function startDevLinkServer(opts: DevLinkServerOptions = {}): Promi
   const log = opts.log ?? silentLogger;
   const token = opts.token ?? DEFAULT_DEV_TOKEN;
   const otherToken = opts.otherToken ?? DEFAULT_DEV_OTHER_TOKEN;
-  if (!/^swb_[A-Za-z0-9_-]{20,}$/.test(token) || !/^swb_[A-Za-z0-9_-]{20,}$/.test(otherToken) || token === otherToken) {
+  const demotedToken = opts.demotedToken ?? DEFAULT_DEV_DEMOTED_TOKEN;
+  const all = [token, otherToken, demotedToken];
+  if (!all.every((t) => /^swb_[A-Za-z0-9_-]{20,}$/.test(t)) || new Set(all).size !== all.length) {
     throw new Error('Tokens must look like swb_<at least 20 URL-safe characters> and differ.');
   }
 
@@ -350,11 +362,12 @@ export async function startDevLinkServer(opts: DevLinkServerOptions = {}): Promi
   const monitor = new Monitor({ store, http: monitorHttp, notifier, config, log: log.child({ mod: 'monitor' }), providers: { ct, dns } });
 
   // Seeds (a persistent DEV_DB keeps its watches; tokens are re-imported idempotently).
-  for (const [t, guildId, channelId, label] of [
-    [token, DEV_GUILD_ID, DEV_CHANNELS.scans, 'Dev Chrome'],
-    [otherToken, DEV_OTHER_GUILD_ID, DEV_CHANNELS.other, 'Other Chrome'],
+  for (const [t, guildId, channelId, label, createdBy] of [
+    [token, DEV_GUILD_ID, DEV_CHANNELS.scans, 'Dev Chrome', 'dev-seed'],
+    [otherToken, DEV_OTHER_GUILD_ID, DEV_CHANNELS.other, 'Other Chrome', 'dev-seed'],
+    [demotedToken, DEV_GUILD_ID, DEV_CHANNELS.scans, 'Demoted Chrome', 'dev-demoted'],
   ] as const) {
-    store.importLinkToken({ guildId, channelId, label, tokenHash: hashLinkToken(t), createdBy: 'dev-seed', createdAt: Date.now(), lastUsedAt: null });
+    store.importLinkToken({ guildId, channelId, label, tokenHash: hashLinkToken(t), createdBy, createdAt: Date.now(), lastUsedAt: null });
   }
   if (store.listWatches().length === 0) {
     addLiveWatch(store, DEV_GUILD_ID, siteUrl, 'Fixture');
@@ -388,6 +401,13 @@ export async function startDevLinkServer(opts: DevLinkServerOptions = {}): Promi
     isGuildActive: (guildId) => guildId in guilds,
     isRestoring: () => false,
     guildInfo: (guildId) => guilds[guildId] ?? null,
+    // Fake Discord members: "dev-demoted" lost Manage Server; nobody sees #mod-logs.
+    creatorAccess: async (guildId, userId) => {
+      const g = guilds[guildId];
+      if (!g) return { manager: false, viewable: new Set<string>() };
+      const viewable = new Set([...g.channels, ...(g.otherChannels ?? [])].map((c) => c.id).filter((id) => id !== DEV_CHANNELS.modlogs));
+      return { manager: userId !== 'dev-demoted', viewable };
+    },
     announce: async (channelId, content) => {
       announced.push({ channelId, content });
       write(`[discord ${channelName(channelId)}] ${content}`);
@@ -426,6 +446,7 @@ export async function startDevLinkServer(opts: DevLinkServerOptions = {}): Promi
     sitePort,
     token,
     otherToken,
+    demotedToken,
     watches,
     announced,
     store,
@@ -451,9 +472,10 @@ function banner(s: DevLinkServer): string {
     `  API URL      ${s.apiUrl}`,
     `  token        ${s.token}    (Dev Server ${DEV_GUILD_ID}, alerts in #scans ${DEV_CHANNELS.scans})`,
     `  other token  ${s.otherToken}    (Other Server ${DEV_OTHER_GUILD_ID})`,
+    `  demoted      ${s.demotedToken}    (Dev Server; its creator lost Manage Server: writes → 403)`,
     `  health       http://127.0.0.1:${s.port}/health`,
     `  fixture site ${s.siteUrl}   (GET ${s.siteUrl}__bump → redeploy + text change + new page)`,
-    '  channels     #scans 1290000000000000001 · #alerts 1290000000000000002 · #announcements 1290000000000000003 (bot cannot post)',
+    '  channels     #scans 1290000000000000001 · #alerts 1290000000000000002 · #announcements 1290000000000000003 (bot cannot post) · #mod-logs 1290000000000000004 (private: hidden from token creators)',
     '  roles        @Alpha 1280000000000000077 · @Site Watcher 1280000000000000078 (managed) · @everyone 1280000000000000000',
     '  watches',
     ...rows,
@@ -483,6 +505,7 @@ if (invokedDirectly()) {
     db: env.DEV_DB?.trim() || ':memory:',
     token: env.DEV_TOKEN?.trim() || undefined,
     otherToken: env.DEV_OTHER_TOKEN?.trim() || undefined,
+    demotedToken: env.DEV_DEMOTED_TOKEN?.trim() || undefined,
     seedUrls: (env.DEV_SEED_URLS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
     allowPrivate: /^(1|true|yes|on)$/i.test(env.DEV_ALLOW_PRIVATE ?? ''),
     realNet: /^(1|true|yes|on)$/i.test(env.DEV_REAL_NET ?? ''),

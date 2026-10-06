@@ -123,7 +123,7 @@ function swbBucket(method, path) {
   if (method === 'POST' && check) return `check:${check[1]}`;
   if (method === 'POST' && path === '/scan') return 'scan';
   if (method === 'POST' && (path === '/watches' || /^\/watches\/\d+\/subdomains\/watch$/.test(path))) return 'add';
-  if (method === 'PATCH' || (method === 'POST' && /^\/watches\/\d+\/(pause|resume)$/.test(path))) return 'manage';
+  if (method === 'PATCH' || method === 'DELETE' || (method === 'POST' && /^\/watches\/\d+\/(pause|resume)$/.test(path))) return 'manage';
   return 'all';
 }
 
@@ -640,11 +640,11 @@ The code in §4 handles this:
 
 **Auth:** `Authorization: Bearer swb_…` (or `X-Link-Token: swb_…`). Missing, unknown or revoked, or the bot is no longer in the token's server → `401 unauthorized`.
 
-**Rights:** a token can read and change every watch of **its own** server (it was created by a Manage Server member) and nothing of other servers: their watch ids are `404`, their channels / roles `400 invalid_channel` / `invalid_role`.
+**Rights:** a token can read and change every watch of **its own** server (it was created by a Manage Server member) and nothing of other servers: their watch ids are `404`, their channels / roles `400 invalid_channel` / `invalid_role`. Changes need the creator to **still** have Manage Server (re-checked, cached 5 min): once they lost it, left or were removed, every management write is `403 forbidden` (reads and Check now still work); show the message and point to a new `/link create`. Alert channels are limited to the ones the creator can see: `GET /guild` lists only those, and any other `channelId` is `400 invalid_channel`.
 
 **CORS:** every response sends `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Headers: Authorization, Content-Type, X-Link-Token`, `Access-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS`, `Access-Control-Max-Age: 600` and `Access-Control-Expose-Headers: Retry-After`. `OPTIONS` → `204` without auth.
 
-**Limits per token:** 120 requests/min overall; `POST /scan` 20 per 10 min; `POST /watches` and `POST /watches/:id/subdomains/watch` together 30 per hour; management writes (`PATCH /watches/:id`, `POST …/pause|resume`, `PATCH …/rules`, `PATCH …/subdomains`) 60 per 10 min. Exceeding one returns `429 rate_limited` + `Retry-After` (seconds). `POST /watches/:id/check` also has a 30 s cooldown **per site**. At most 3 scans run on the bot at once; beyond that `POST /scan` also gets `429 rate_limited`, with `Retry-After: 5`.
+**Limits per token:** 120 requests/min overall; `POST /scan` 20 per 10 min; `POST /watches` and `POST /watches/:id/subdomains/watch` together 30 per hour; management writes (`PATCH /watches/:id`, `DELETE /watches/:id`, `POST …/pause|resume`, `PATCH …/rules`, `PATCH …/subdomains`) 60 per 10 min. Exceeding one returns `429 rate_limited` + `Retry-After` (seconds). `POST /watches/:id/check` also has a 30 s cooldown **per site**. At most 3 scans run on the bot at once; beyond that `POST /scan` also gets `429 rate_limited`, with `Retry-After: 5`.
 
 **Bodies:** JSON objects up to 32 KB (`413 too_large`), for `POST` and `PATCH`; invalid JSON returns `400 bad_request`; a body that takes over 15 s to arrive returns `408 timeout`. Every response is JSON. `PATCH` bodies are strict: unknown fields and wrong types are `400 bad_request`.
 
@@ -654,6 +654,7 @@ The code in §4 handles this:
 |---|---|
 | `bad_request`, `invalid_url` (also private / internal hosts), `invalid_interval`, `invalid_pattern`, `invalid_channel`, `invalid_role` | 400 |
 | `unauthorized` | 401 |
+| `forbidden` (the token's creator lost Manage Server; management writes only) | 403 |
 | `not_found` | 404 |
 | `method_not_allowed` | 405 |
 | `timeout` | 408 (slow request body) or 504 (check over 60 s) |

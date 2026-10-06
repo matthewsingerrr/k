@@ -67,8 +67,8 @@ Constants come from src/discord/commands.ts. The API must import them, never cop
 | Field | Rule | On failure |
 |---|---|---|
 | `name` | `cleanName()`: control characters become spaces, whitespace is collapsed, then trimmed. 1..`MAX_NAME_CHARS` (100) characters. Not number-only (`/^#?\d+$/`). Unique within the server, case-insensitive (`nameTaken(deps, guild, name, w.id)`). | `400 bad_request`; taken → `409 name_taken` |
-| `intervalSec` | A JSON number, finite and > 0. Rounded and **clamped** to [`minInterval(config)` (env `MIN_INTERVAL_SEC`, default 1), `MAX_INTERVAL_SEC` 3600], as `POST /watches` already does. | `400 invalid_interval` |
-| `sweepSec` | A JSON number, finite and > 0. Rounded and **clamped** to [`SWEEP_MIN_SEC` 30, `SWEEP_MAX_SEC` 86400]. | `400 invalid_interval` |
+| `intervalSec` | A whole number in [`minInterval(config)` (env `MIN_INTERVAL_SEC`, default 1), `MAX_INTERVAL_SEC` 3600], like the Settings modal's `parseSeconds` (no rounding or clamping; `POST /watches` still clamps). The watch's current value is always accepted. | `400 invalid_interval` |
+| `sweepSec` | A whole number in [`SWEEP_MIN_SEC` 30, `SWEEP_MAX_SEC` 86400]; the current value is always accepted. | `400 invalid_interval` |
 | `channelId` | Snowflake string. Must be a **text or announcement** channel of the **token's** server, per `deps.guildInfo(token.guildId)`. Threads, voice, forum and other servers' channels are refused. If the bot can't post there, the change is still saved and a `warnings` line says why (parity with Settings). | `400 invalid_channel`; Discord cache not ready → `503 unavailable` |
 | `pingRoleId` | `null` (no ping) or a role id of the token's server. The guild id itself means @everyone, as in `roleMention`. | `400 invalid_role`; cache not ready → `503 unavailable` |
 | `paused` | boolean | `400 bad_request` |
@@ -746,4 +746,12 @@ Where the implementation had to choose, it chose this:
 - **pause / resume bodies** are strict too: only an empty body or `{}`.
 - **`health.ts`** gained an optional `host` (the production server still listens on every interface); the local dev server binds 127.0.0.1.
 - **Local dev server**: `npm run dev:link` (scripts/dev-link-server.ts, INTEGRATION.md §10).
+
+### 10.1 Review fixes
+
+- **The creator's rights are re-checked.** Discord buttons call `requireManageGuild` on every click; the API now asks `deps.creatorAccess(guildId, token.createdBy)` (src/index.ts: one REST member fetch with `force`, no GuildMembers intent) before every management write (`POST /watches`, `PATCH` / `DELETE /watches/:id`, pause, resume, rules, subdomains, subdomains/watch) and `GET /guild`, cached 5 min per creator. No Manage Server (demoted, left, kicked, banned) → `403 forbidden`; Discord can't tell → `503 unavailable` + `Retry-After: 30`. Reads and `/check` are unchanged. `/link list` shows each link's creator.
+- **Alert channels the creator can see.** `GET /guild` lists only channels the creator has View Channel in, and `channelId` (PATCH, POST) must be one of them (`400 invalid_channel`), as Discord's channel select offers.
+- **Pattern probes have a budget.** `validateNewPatterns` gives one list's new entries 250 ms of speed probes in total (the modal and `PATCH …/rules` alike), so one save blocks the event loop for about 0.5 s at most; past it: `invalid_pattern` "Too many new … patterns to check at once".
+- **`DELETE /watches/:id`** takes from `manage` as well.
+- **`PATCH` intervals** are strict (see §2), as the Settings modal.
 

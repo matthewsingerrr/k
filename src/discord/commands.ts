@@ -471,6 +471,12 @@ const BROAD_SAMPLE = 'The quick brown fox jumps over the lazy dog 1234567890';
 
 /** Total time a pattern may take on the adversarial probe inputs below. Sane patterns need well under 10ms. */
 const REGEX_PROBE_TIMEOUT_MS = 200;
+/**
+ * Total probe time one validateNewPatterns call may spend (a list's new entries share it), so one Rules save — the modal or
+ * PATCH /watches/:id/rules, two lists — blocks the event loop for at most about twice this. 25 ordinary patterns need ~50ms.
+ */
+const PATTERN_LIST_PROBE_BUDGET_MS = 250;
+const TOO_SLOW = 'That pattern is too slow on long pages (catastrophic backtracking). Please simplify it.';
 const REGEX_PROBE_INPUTS: readonly string[] = (() => {
   const n = 5000;
   return [
@@ -508,7 +514,7 @@ export function regexIsFast(source: string, flags: string, timeoutMs = REGEX_PRO
  * Validate an ignore (text) or exclude (URL) regex: syntax, ReDoS shape, speed on adversarial input, and not so broad that it
  * would blank out all text / exclude every URL. Returns the trimmed pattern.
  */
-export function validatePattern(pattern: string, kind: 'ignore' | 'exclude'): string {
+export function validatePattern(pattern: string, kind: 'ignore' | 'exclude', probeMs = REGEX_PROBE_TIMEOUT_MS): string {
   const p = pattern.trim();
   if (!p) throw new UserError('The pattern cannot be empty.');
   if (p.length > MAX_PATTERN_CHARS) throw new UserError(`The pattern is too long (max ${MAX_PATTERN_CHARS} characters).`);
@@ -522,9 +528,7 @@ export function validatePattern(pattern: string, kind: 'ignore' | 'exclude'): st
   if (!glob && hasNestedQuantifier(p)) {
     throw new UserError('That pattern has nested repetition like `(a+)+`, which can freeze the bot on some pages. Please simplify it.');
   }
-  if (!glob && !regexIsFast(p, re.flags)) {
-    throw new UserError('That pattern is too slow on long pages (catastrophic backtracking). Please simplify it.');
-  }
+  if (!glob && !regexIsFast(p, re.flags, probeMs)) throw new UserError(TOO_SLOW);
   if (kind === 'ignore') {
     re.lastIndex = 0;
     const m = re.exec(BROAD_SAMPLE);
@@ -545,12 +549,17 @@ export function validatePattern(pattern: string, kind: 'ignore' | 'exclude'): st
 export function validateNewPatterns(next: string[], current: string[], kind: 'ignore' | 'exclude'): void {
   const what = kind === 'ignore' ? 'ignore' : 'skip-URL';
   if (next.length > MAX_PATTERNS) throw new ListEntryError(`At most ${MAX_PATTERNS} ${what} patterns per site (you entered ${next.length}).`, null);
+  const deadline = performance.now() + PATTERN_LIST_PROBE_BUDGET_MS;
+  const busy = `Too many new ${what} patterns to check at once. Save a few, then add the rest.`;
   for (let n = 0; n < next.length; n++) {
     const p = next[n];
     if (current.includes(p)) continue; // validated when it was added
+    const probeMs = Math.min(REGEX_PROBE_TIMEOUT_MS, Math.floor(deadline - performance.now()));
+    if (probeMs <= 0) throw new ListEntryError(busy, n);
     try {
-      validatePattern(p, kind);
+      validatePattern(p, kind, probeMs);
     } catch (err) {
+      if (err instanceof UserError && err.message === TOO_SLOW && probeMs < REGEX_PROBE_TIMEOUT_MS) throw new ListEntryError(busy, n);
       if (err instanceof UserError) throw new ListEntryError(`${kind === 'ignore' ? 'Ignore' : 'Skip-URL'} pattern ${codeSpan(p, 100)}: ${err.message}`, n);
       throw err;
     }

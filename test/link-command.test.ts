@@ -390,8 +390,8 @@ describe('/link list', () => {
     expect(isEphemeral(last(calls))).toBe(true);
     expect(text).toContain(`Links (2/${MAX_LINKS_PER_GUILD})`);
     expect(text).toContain(`${PUBLIC}/api/v1`);
-    expect(text).toMatch(new RegExp(`\\*\\*Chrome\\*\\* · <#${CHANNEL}> · created <t:\\d+:R> · last used <t:1759673000:R>`));
-    expect(text).toMatch(new RegExp(`\\*\\*Server bot\\*\\* · <#${ALERTS}> · created <t:\\d+:R> · last used never`));
+    expect(text).toMatch(new RegExp(`\\*\\*Chrome\\*\\* · <#${CHANNEL}> · by <@${USER}> · created <t:\\d+:R> · last used <t:1759673000:R>`));
+    expect(text).toMatch(new RegExp(`\\*\\*Server bot\\*\\* · <#${ALERTS}> · by <@${USER}> · created <t:\\d+:R> · last used never`));
     expect(text).not.toContain('Other');
     expect(text).not.toMatch(TOKEN_RE);
   });

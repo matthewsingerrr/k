@@ -203,11 +203,30 @@ export interface LinkApiDeps {
    * channel / role changes and GET /guild then answer 503, and cards show channelName: null, canPost: null.
    */
   guildInfo?: (guildId: string) => GuildSnapshot | null;
+  /**
+   * What the token's creator may do in its server right now (one REST member fetch, no privileged intent): Manage Server,
+   * and the channels they can see. Management writes need Manage Server, like the Discord buttons; an alert channel must
+   * be one the creator can see, like Discord's channel picker. null or a throw = Discord can't tell right now (503).
+   * Absent → every creator counts as a manager who sees every channel.
+   */
+  creatorAccess?: (guildId: string, userId: string) => Promise<CreatorAccess | null>;
   now?: () => number;
+}
+
+/** A token creator's rights in the token's server (see LinkApiDeps.creatorAccess). */
+export interface CreatorAccess {
+  /** Manage Server (the server owner and Administrators have it). false when they left, were kicked or banned. */
+  manager: boolean;
+  /** Channel ids the creator can view; null = every channel. */
+  viewable: ReadonlySet<string> | null;
 }
 
 /** Minimum seconds between two manual checks of the same site through the API. */
 export const CHECK_COOLDOWN_SEC = 30;
+/** How long a token creator's rights (CreatorAccess) are reused. */
+const MANAGER_TTL_MS = 5 * 60_000;
+/** Routes whose non-GET methods change the watch list or a watch's settings (Discord: Manage Server). */
+const MANAGE_ROUTES = new Set(['watches', 'watch', 'pause', 'resume', 'rules', 'subdomains', 'watchSubdomain']);
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -496,10 +515,18 @@ function limitParam(params: URLSearchParams, def: number, max: number): number {
   return raw === null ? def : Math.min(max, Math.max(1, raw));
 }
 
-/** A JSON number of seconds (finite, > 0), rounded and clamped to [min, max]; null when it isn't one. */
+/** A JSON number of seconds (finite, > 0), rounded and clamped to [min, max]; null when it isn't one. (POST /watches) */
 function seconds(v: unknown, min: number, max: number): number | null {
   if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) return null;
   return Math.min(max, Math.max(min, Math.round(v)));
+}
+
+/**
+ * A whole number of seconds in [min, max], else null: the ⚙️ Settings modal's rule (parseSeconds), for PATCH. The value
+ * the watch already has is always accepted (an unchanged field is a no-op even if the limits moved since).
+ */
+function wholeSeconds(v: unknown, min: number, max: number, current: number): number | null {
+  return typeof v === 'number' && Number.isInteger(v) && ((v >= min && v <= max) || v === current) ? v : null;
 }
 
 function stripScheme(url: string): string {
@@ -757,6 +784,7 @@ function limitClasses(route: Route, method: string): LimitClass[] {
   if ((route.name === 'watches' && method === 'POST') || route.name === 'watchSubdomain') return ['add'];
   if (route.name === 'pause' || route.name === 'resume') return ['manage'];
   if (method === 'PATCH' && (route.name === 'watch' || route.name === 'rules' || route.name === 'subdomains')) return ['manage'];
+  if (method === 'DELETE' && route.name === 'watch') return ['manage']; // the most destructive write: pages and history go too
   return [];
 }
 
@@ -768,6 +796,8 @@ interface Ctx {
   query: URLSearchParams;
   token: LinkToken;
   body: Record<string, unknown>;
+  /** The token creator's rights, read for management writes and GET /guild; null otherwise or without the dep. */
+  access: CreatorAccess | null;
 }
 
 /** A validated change to a watch: what to write and how to describe it. */
@@ -794,6 +824,8 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
   const now = typeof deps.now === 'function' ? deps.now : Date.now;
   const scanFn = deps.scanFn ?? scanSite;
   const limiter = new RateLimiter();
+  /** "guildId:userId" → the creator's rights, kept MANAGER_TTL_MS. */
+  const creators = new Map<string, { access: CreatorAccess; at: number }>();
   const checks = new Map<number, Promise<TickSummary>>();
   /** Last API-triggered check start per watch (bounded: one entry per watch). */
   const lastCheckStart = new Map<number, number>();
@@ -833,6 +865,27 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
     }
   };
 
+  /** The token creator's rights now (cached MANAGER_TTL_MS); null when there is no such dep (no restriction). */
+  const creatorOf = async (token: LinkToken, t: number): Promise<CreatorAccess | null> => {
+    if (!deps.creatorAccess) return null;
+    const key = `${token.guildId}:${token.createdBy}`;
+    const hit = creators.get(key);
+    if (hit && t - hit.at < MANAGER_TTL_MS) return hit.access;
+    let access: CreatorAccess | null = null;
+    try {
+      const a = await deps.creatorAccess(token.guildId, token.createdBy);
+      if (a && typeof a.manager === 'boolean') access = { manager: a.manager, viewable: a.viewable instanceof Set ? a.viewable : null };
+    } catch {
+      access = null;
+    }
+    if (!access) {
+      throw new ApiError(503, 'unavailable', "Discord can't confirm this link's permissions right now — try again in a minute.", { 'retry-after': '30' });
+    }
+    if (creators.size > 500) creators.clear();
+    creators.set(key, { access, at: t });
+    return access;
+  };
+
   /** Discord's view of the token's server; null when unknown (no dep, not ready, not cached, or it threw). */
   const guildOf = (guildId: string): GuildSnapshot | null => {
     if (!deps.guildInfo) return null;
@@ -851,10 +904,13 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
     return g;
   };
 
-  /** A text or announcement channel of the server (what Settings' channel select offers), else 400 invalid_channel. */
-  const alertChannel = (guildId: string, raw: unknown, field: string): ApiGuildInfo['channels'][number] => {
+  /**
+   * A text or announcement channel of the server that the token's creator can see (what Settings' channel select offers
+   * them), else 400 invalid_channel.
+   */
+  const alertChannel = (guildId: string, raw: unknown, field: string, access: CreatorAccess | null): ApiGuildInfo['channels'][number] => {
     if (typeof raw !== 'string') throw bad('bad_request', `${field} must be a channel id.`, field);
-    const c = requireGuild(guildId).channels.find((x) => x.id === raw);
+    const c = requireGuild(guildId).channels.find((x) => x.id === raw && (!access?.viewable || access.viewable.has(x.id)));
     if (!c) throw bad('invalid_channel', 'That is not a text or announcement channel of this Discord server.', field);
     return c;
   };
@@ -1012,7 +1068,7 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
   };
 
   /** Validates a ⚙️ Settings / 🧩 Features / pause body against `w`; writes nothing. */
-  const planSettings = (w: Watch, body: Record<string, unknown>): Plan => {
+  const planSettings = (w: Watch, body: Record<string, unknown>, access: CreatorAccess | null = null): Plan => {
     strictKeys(body, SETTINGS_FIELDS);
     const plan: Plan = { patch: {}, changed: [], parts: [], warnings: [] };
     const { patch, changed, parts, warnings } = plan;
@@ -1036,8 +1092,8 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
     }
     if (body.intervalSec !== undefined) {
       const min = minInterval(config);
-      const v = seconds(body.intervalSec, min, MAX_INTERVAL_SEC);
-      if (v === null) throw bad('invalid_interval', `intervalSec must be a number of seconds (${min}–${MAX_INTERVAL_SEC}).`, 'intervalSec');
+      const v = wholeSeconds(body.intervalSec, min, MAX_INTERVAL_SEC, w.intervalSec);
+      if (v === null) throw bad('invalid_interval', `intervalSec must be a whole number of seconds, ${min}–${MAX_INTERVAL_SEC}.`, 'intervalSec');
       if (v !== w.intervalSec) {
         patch.intervalSec = v;
         changed.push('intervalSec');
@@ -1045,8 +1101,8 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
       }
     }
     if (body.sweepSec !== undefined) {
-      const v = seconds(body.sweepSec, SWEEP_MIN_SEC, SWEEP_MAX_SEC);
-      if (v === null) throw bad('invalid_interval', `sweepSec must be a number of seconds (${SWEEP_MIN_SEC}–${SWEEP_MAX_SEC}).`, 'sweepSec');
+      const v = wholeSeconds(body.sweepSec, SWEEP_MIN_SEC, SWEEP_MAX_SEC, w.sweepSec);
+      if (v === null) throw bad('invalid_interval', `sweepSec must be a whole number of seconds, ${SWEEP_MIN_SEC}–${SWEEP_MAX_SEC}.`, 'sweepSec');
       if (v !== w.sweepSec) {
         patch.sweepSec = v;
         changed.push('sweepSec');
@@ -1054,7 +1110,7 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
       }
     }
     if (body.channelId !== undefined && body.channelId !== w.channelId) {
-      const c = alertChannel(w.guildId, body.channelId, 'channelId');
+      const c = alertChannel(w.guildId, body.channelId, 'channelId', access);
       patch.channelId = c.id;
       changed.push('channelId');
       parts.push(`channel → #${c.name}`);
@@ -1320,7 +1376,7 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
     sendJson(res, 200, rawUrl === null ? { watches, summary } : { watches, watched: list.length > 0, summary });
   };
 
-  const addWatch = async ({ res, token, body }: Ctx) => {
+  const addWatch = async ({ res, token, body, access }: Ctx) => {
     const raw = body.url;
     const parsed = typeof raw === 'string' ? parseWatchInput(raw) : null;
     if (!parsed) {
@@ -1359,7 +1415,7 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
     // Alert channel and ping role: from the token's server only (default: the token's channel, no ping).
     let channelId = token.channelId;
     if (body.channelId !== undefined && body.channelId !== null && body.channelId !== token.channelId) {
-      channelId = alertChannel(token.guildId, body.channelId, 'channelId').id;
+      channelId = alertChannel(token.guildId, body.channelId, 'channelId', access).id;
     }
     let pingRoleId: string | null = null;
     if (body.pingRoleId !== undefined && body.pingRoleId !== null) {
@@ -1450,10 +1506,10 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
     sendJson(res, 200, { watch: toApiWatch(store, w), card: cardOf(w, guildOf(w.guildId)), events, limits: limits() });
   };
 
-  const patchWatch = ({ res, token, route, body }: Ctx) => {
+  const patchWatch = ({ res, token, route, body, access }: Ctx) => {
     const w = ownWatch(route, token);
     const monitor = requireMonitor();
-    sendJson(res, 200, applySettings(w, planSettings(w, body), token, monitor, 'update'));
+    sendJson(res, 200, applySettings(w, planSettings(w, body, access), token, monitor, 'update'));
   };
 
   const deleteWatch = ({ res, token, route }: Ctx) => {
@@ -1639,12 +1695,13 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
     sendJson(res, 200, { events, nextBefore: events.length === limit ? events[events.length - 1].id : null });
   };
 
-  const guild = ({ res, token }: Ctx) => {
+  const guild = ({ res, token, access }: Ctx) => {
     const g = requireGuild(token.guildId);
     const info: ApiGuildInfo = {
       guild: { id: g.guild.id, name: g.guild.name },
       tokenChannelId: token.channelId,
-      channels: g.channels.map((c) => ({ id: c.id, name: c.name, type: c.type, category: c.category ?? null, canPost: c.canPost, missing: [...c.missing] })),
+      // only the channels the token's creator can see (Discord's channel picker shows them no others)
+      channels: g.channels.filter((c) => !access?.viewable || access.viewable.has(c.id)).map((c) => ({ id: c.id, name: c.name, type: c.type, category: c.category ?? null, canPost: c.canPost, missing: [...c.missing] })),
       roles: g.roles.map((r) => ({ id: r.id, name: r.name, everyone: r.everyone, managed: r.managed, color: r.color })),
     };
     sendJson(res, 200, info);
@@ -1752,6 +1809,12 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
     if (retryAfter > 0) {
       throw new ApiError(429, 'rate_limited', `Too many requests — try again in ${retryAfter}s.`, { 'retry-after': String(retryAfter) });
     }
+    // Management writes need the creator's Manage Server, like the Discord buttons; GET /guild lists what they can see.
+    const write = method !== 'GET' && MANAGE_ROUTES.has(route.name);
+    const access = write || route.name === 'guild' ? await creatorOf(token, t) : null;
+    if (write && access && !access.manager) {
+      throw new ApiError(403, 'forbidden', 'The member who created this link no longer has Manage Server in this server. Ask an admin for a new /link create.');
+    }
     if (token.lastUsedAt === null || t - token.lastUsedAt >= TOUCH_EVERY_MS) {
       try {
         store.touchLinkToken(token.id, t);
@@ -1772,7 +1835,7 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
         body = read.value;
       }
     }
-    await dispatch({ req, res, method, route, query, token, body });
+    await dispatch({ req, res, method, route, query, token, body, access });
   };
 
   const fail = (res: http.ServerResponse, err: unknown) => {

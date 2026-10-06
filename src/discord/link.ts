@@ -257,7 +257,8 @@ export function renderLinkList(config: Config, tokens: LinkToken[]): APIEmbed {
   const head = base ? `API URL: ${codeSpan(base, 300)}` : NO_PUBLIC_DOMAIN.replace(' The token below already works; you don’t need a new one.', '');
   const off = config.linkApi ? '' : '\n⚠️ The Link API is turned off (`LINK_API=false`) — tokens can’t be used until it’s on.';
   const lines = tokens.map(
-    (t) => `**${labelOf(t)}** · ${channelMention(t.channelId)} · created ${when(t.createdAt)} · last used ${when(t.lastUsedAt)}`,
+    (t) =>
+      `**${labelOf(t)}** · ${channelMention(t.channelId)} · by ${/^\d{5,25}$/.test(t.createdBy) ? `<@${t.createdBy}>` : 'unknown'} · created ${when(t.createdAt)} · last used ${when(t.lastUsedAt)}`,
   );
   return {
     title: `🔗 Links (${tokens.length}/${MAX_LINKS_PER_GUILD})`,

@@ -10,6 +10,8 @@ The Link API lets outside clients (the **Arkham Dev Tags** browser extension, ot
 
 Every client acts on **one Discord server** (guild) and **one alert channel**. Both are fixed by the token it uses. Tokens are issued in Discord with `/link create`.
 
+Changing the server's watches needs the same right as the Discord buttons: the member who ran `/link create` must **still** have Manage Server. Management writes (add, remove, settings, pause / resume, rules, subdomains) re-check it (cached up to 5 minutes) and answer `403 forbidden` once that member has lost it, left or been removed; reads and **Check now** keep working. `/link list` shows who created each link, so an admin can revoke the right one.
+
 > This document describes the contract in `src/link/api.ts` (endpoint JSDoc) and `src/link/types.ts` (schemas). If the two ever disagree, the source wins; please file a fix for this document.
 
 ---
@@ -96,11 +98,12 @@ Validation errors of the management routes may also carry `field`, a JSON path i
 |---|---|---|
 | 400 | `bad_request` | Body is not valid JSON or not a JSON object, or a field has the wrong type (for example `features.text: "yes"` or an unknown `subdomains` mode) |
 | 400 | `invalid_url` | `url` is not a usable website URL, or it points at a private / internal address (`localhost`, `127.0.0.1`, `10.x`, `192.168.x`, `169.254.x`, `*.internal`, `*.local`, …) |
-| 400 | `invalid_interval` | `intervalSec` / `sweepSec` is not a usable number of seconds (in-range numbers are used, out-of-range ones are clamped) |
-| 400 | `invalid_pattern` | An ignore or skip-URL pattern was refused (bad regex, nested repetition like `(a+)+`, too slow, too broad, over 300 characters), or a list has more than 25 entries |
-| 400 | `invalid_channel` | `channelId` is not a text or announcement channel of the token's server |
+| 400 | `invalid_interval` | `intervalSec` / `sweepSec` is not a usable number of seconds. `POST /watches` rounds and clamps an in-range-ish number; `PATCH /watches/:id` takes whole seconds in range only, like the ⚙️ Settings modal |
+| 400 | `invalid_pattern` | An ignore or skip-URL pattern was refused (bad regex, nested repetition like `(a+)+`, too slow, too broad, over 300 characters), a list has more than 25 entries, or one save brings more new patterns than the bot can check at once (it checks each new pattern's speed; save a few, then the rest) |
+| 400 | `invalid_channel` | `channelId` is not a text or announcement channel of the token's server that the token's creator can see |
 | 400 | `invalid_role` | `pingRoleId` is not a role of the token's server |
 | 401 | `unauthorized` | Token missing, unknown or revoked, or the bot is no longer in the token's server |
+| 403 | `forbidden` | A management write, but the member who created the token no longer has Manage Server in its server (demoted, left, kicked or banned). Ask an admin for a new `/link create` |
 | 404 | `not_found` | Unknown route, or a watch id that doesn't exist **in this token's server** |
 | 405 | `method_not_allowed` | Known route, wrong HTTP method (the response has an `Allow` header) |
 | 408 | `timeout` | The request body didn't arrive within 15 s |
@@ -110,7 +113,7 @@ Validation errors of the management routes may also carry `field`, a JSON path i
 | 429 | `rate_limited` | A rate limit was hit (see §5). Always has a `Retry-After` header. |
 | 500 | `internal_error` | Unexpected error on the bot. The message is generic; details stay in the bot's logs. |
 | 502 | `scan_failed` | The scan itself could not run (not "the site is down"; see `POST /scan`) |
-| 503 | `unavailable` | The bot is still starting up (`Retry-After: 5`): every route that writes or checks needs its monitor, and channel / role changes and `GET /guild` need Discord's server cache (Discord not ready). Right after a redeploy it may also still be restoring link tokens from its Discord backup, so an unknown token gets `503` + `Retry-After: 15` instead of `401` for up to a few minutes. Retry; don't treat it as a revoked token. |
+| 503 | `unavailable` | The bot is still starting up (`Retry-After: 5`): every route that writes or checks needs its monitor, and channel / role changes and `GET /guild` need Discord's server cache (Discord not ready). Right after a redeploy it may also still be restoring link tokens from its Discord backup, so an unknown token gets `503` + `Retry-After: 15` instead of `401` for up to a few minutes. Retry; don't treat it as a revoked token. A management write also gets `503` + `Retry-After: 30` when Discord can't confirm the token creator's rights right now. |
 | 504 | `timeout` | `POST /watches/:id/check` took longer than 60 s |
 
 Treat any other 400 as "fix the request". Treat any other 5xx (for example during a redeploy) as a temporary failure and retry later. Treat an unknown `code` as a generic error.
@@ -124,7 +127,7 @@ Limits are per token, enforced as in-memory token buckets:
 | All requests | 120 per minute |
 | `POST /scan` | 20 per 10 minutes |
 | `POST /watches` and `POST /watches/:id/subdomains/watch` (one shared bucket) | 30 per hour |
-| Management writes: `PATCH /watches/:id`, `POST /watches/:id/pause` and `/resume`, `PATCH /watches/:id/rules`, `PATCH /watches/:id/subdomains` | 60 per 10 minutes |
+| Management writes: `PATCH /watches/:id`, `DELETE /watches/:id`, `POST /watches/:id/pause` and `/resume`, `PATCH /watches/:id/rules`, `PATCH /watches/:id/subdomains` | 60 per 10 minutes |
 
 Every request also counts against "All requests".
 
@@ -403,7 +406,7 @@ Adds a site to the token's server. Its alerts go to the token's channel.
 | `name` | string | Optional. The default comes from the domain (as for `/watch add`). The default, or a name you send that is already taken, is made unique within the server ("Hookedpad 2"). Leaving `name` out, or sending `""` or `null`, uses the default. A name that is only whitespace or only a number, or one over 100 characters, gets `400 bad_request`. |
 | `intervalSec` | number | Optional. Defaults to the bot's default (2 s). Numbers are rounded and clamped to `[MIN_INTERVAL_SEC, 3600]`; a value that isn't a positive number gets `400 invalid_interval`. |
 | `features` | object | Optional switches: `deploy`, `text`, `pages`, `subdomains`, `files`, `status`, `codeIntel`. Any switch you leave out keeps its default. A value that isn't `true`/`false` gets `400 bad_request`. |
-| `channelId` | string | Optional alert channel: a text or announcement channel of the token's server (see `GET /guild`). Default: the token's channel. Another channel gets `400 invalid_channel`; `503 unavailable` while Discord isn't ready. |
+| `channelId` | string | Optional alert channel: a text or announcement channel of the token's server that the token's creator can see (see `GET /guild`). Default: the token's channel. Another channel gets `400 invalid_channel`; `503 unavailable` while Discord isn't ready. |
 | `pingRoleId` | string \| null | Optional role to ping on alerts: a role of the token's server; the server id itself means @everyone. Default: no ping. Another server's role gets `400 invalid_role`. |
 
 Responses:
@@ -578,9 +581,9 @@ The management routes below do what the dashboard's buttons and forms do, with t
 | Field | Type | Rules |
 |---|---|---|
 | `name` | string | Control characters become spaces, whitespace is collapsed and trimmed; 1–100 characters; not just a number (`12`, `#12`). Unique in the server, ignoring case: a taken name is `409 name_taken`; anything else invalid is `400 bad_request`. |
-| `intervalSec` | number | Seconds between homepage / redeploy / uptime checks. Rounded and clamped to [`MIN_INTERVAL_SEC`, 3600]. Not a positive number → `400 invalid_interval`. |
-| `sweepSec` | number | Every tracked page is re-checked within this time. Rounded and clamped to [30, 86400]. Not a positive number → `400 invalid_interval`. |
-| `channelId` | string | A text or announcement channel of the token's server (`GET /guild`), else `400 invalid_channel`. Saved even when the bot can't post there (with a warning). `503` while Discord isn't ready. |
+| `intervalSec` | number | Seconds between homepage / redeploy / uptime checks: a whole number in [`MIN_INTERVAL_SEC`, 3600], like the ⚙️ Settings modal; anything else → `400 invalid_interval` (no rounding or clamping). The value the site already has is always accepted. |
+| `sweepSec` | number | Every tracked page is re-checked within this time: a whole number in [30, 86400], else `400 invalid_interval`. The current value is always accepted. |
+| `channelId` | string | A text or announcement channel of the token's server that the token's creator can see (`GET /guild`), else `400 invalid_channel`. Saved even when the bot can't post there (with a warning). `503` while Discord isn't ready. |
 | `pingRoleId` | string \| null | A role of the token's server (the server id = @everyone), else `400 invalid_role`; `null` = no ping. |
 | `paused` | boolean | Same as `/pause` / `/resume`. |
 | `checks` | object | Partial switches: `deploy`, `text`, `pages`, `subdomains`, `files`, `status`, `codeIntel`, `maskNumbers` ("Ignore numbers"). An unknown key is `400 bad_request`. Switches you leave out keep their value. |
@@ -761,7 +764,7 @@ The token's server as Discord's cache knows it, for the alert-channel and ping-r
 }
 ```
 
-- `channels`: text and announcement channels only, in Discord's order. `canPost` / `missing` say whether the bot has View Channel, Send Messages and Embed Links there.
+- `channels`: text and announcement channels only, in Discord's order, and only those the member who created the token can see (as Discord's own channel picker shows them). `canPost` / `missing` say whether the bot has View Channel, Send Messages and Embed Links there.
 - `roles`: highest first, @everyone (id = the server id) last. `managed` roles belong to bots and integrations.
 - `503 unavailable` + `Retry-After: 5` while Discord isn't ready.
 

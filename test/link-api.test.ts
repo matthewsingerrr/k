@@ -161,6 +161,7 @@ async function setup(
     isGuildActive?: (guildId: string) => boolean;
     isRestoring?: () => boolean;
     guildInfo?: LinkApiDeps['guildInfo'];
+    creatorAccess?: LinkApiDeps['creatorAccess'];
     getMonitor?: () => Monitor | null;
   } = {},
 ): Promise<Harness> {
@@ -189,6 +190,7 @@ async function setup(
     isGuildActive: opts.isGuildActive,
     isRestoring: opts.isRestoring,
     guildInfo: opts.guildInfo,
+    creatorAccess: opts.creatorAccess,
   };
   const handler = createLinkApi(deps);
   const server = http.createServer((req, res) => {
@@ -1328,15 +1330,34 @@ describe('Link API management: PATCH /watches/:id (Settings, Features, Pause)', 
     expect(h.monitor.calls.updated).toEqual([]);
   });
 
-  it('clamps intervals like POST /watches', async () => {
+  it('takes intervals like the Settings modal: whole seconds in range, else 400 invalid_interval (no clamping)', async () => {
     const { h, w } = await manage();
-    let r = await call(h, 'PATCH', `/watches/${w.id}`, { intervalSec: 0.4, sweepSec: 5 });
-    expect(r.json.watch.intervalSec).toBe(5); // minInterval (MIN_INTERVAL_SEC = 5 here)
+    const update = vi.spyOn(h.store, 'updateWatch');
+    const cases: Array<[Record<string, unknown>, string]> = [
+      [{ intervalSec: 0.4 }, 'intervalSec'],
+      [{ intervalSec: 4 }, 'intervalSec'], // below MIN_INTERVAL_SEC = 5 here
+      [{ intervalSec: 3601 }, 'intervalSec'],
+      [{ intervalSec: 42.6 }, 'intervalSec'],
+      [{ sweepSec: 5 }, 'sweepSec'],
+      [{ sweepSec: 999_999 }, 'sweepSec'],
+      [{ intervalSec: 60, sweepSec: 29.5 }, 'sweepSec'],
+    ];
+    for (const [body, field] of cases) {
+      const r = await call(h, 'PATCH', `/watches/${w.id}`, body);
+      expect(r.status, JSON.stringify(body)).toBe(400);
+      expect(r.json.error.code, JSON.stringify(body)).toBe('invalid_interval');
+      expect(r.json.error.field, JSON.stringify(body)).toBe(field);
+    }
+    expect(update).not.toHaveBeenCalled();
+    let r = await call(h, 'PATCH', `/watches/${w.id}`, { intervalSec: 5, sweepSec: 30 });
     expect(r.json.card.schedule).toEqual({ intervalSec: 5, sweepSec: 30 });
-    r = await call(h, 'PATCH', `/watches/${w.id}`, { intervalSec: 99_999, sweepSec: 1e9 });
+    r = await call(h, 'PATCH', `/watches/${w.id}`, { intervalSec: 3600, sweepSec: 86400 });
     expect(r.json.card.schedule).toEqual({ intervalSec: 3600, sweepSec: 86400 });
-    r = await call(h, 'PATCH', `/watches/${w.id}`, { intervalSec: 42.6 });
-    expect(r.json.watch.intervalSec).toBe(43);
+    // the value the watch already has is a no-op even when the limits moved since
+    h.store.updateWatch(w.id, { intervalSec: 2 });
+    r = await call(h, 'PATCH', `/watches/${w.id}`, { intervalSec: 2, name: 'Hooked' });
+    expect(r.status).toBe(200);
+    expect(r.json.changed).toEqual(['name']);
     expect(h.monitor.calls.updated).toHaveLength(3);
   });
 
@@ -1965,5 +1986,78 @@ describe('Link API management: rate limits', () => {
     expect((await call(h, 'PATCH', `/watches/${w.id + 1}`, {}, { token: h.token2 })).status).toBe(200);
     h.clock.t += retry * 1000;
     expect((await call(h, 'PATCH', `/watches/${w.id}`, { paused: true })).status).toBe(200);
+  });
+});
+
+describe('Link API: the token creator must still have Manage Server', () => {
+  it('403s management writes once the creator is demoted, 503s when Discord cannot tell, keeps reads working', async () => {
+    const mgr: Record<string, boolean | null> = { u1: true };
+    const asked: string[] = [];
+    const { h, w } = await manage({
+      creatorAccess: async (_g: string, u: string) => {
+        asked.push(u);
+        const m = u in mgr ? mgr[u] : false;
+        return m === null ? null : { manager: m, viewable: null };
+      },
+    });
+    expect((await call(h, 'PATCH', `/watches/${w.id}`, { pingRoleId: G1 })).status).toBe(200);
+    expect((await call(h, 'POST', `/watches/${w.id}/pause`, {})).status).toBe(200);
+    expect(asked).toEqual(['u1']); // cached
+    mgr.u1 = false; // demoted
+    h.clock.t += 5 * 60_000;
+    let r = await call(h, 'PATCH', `/watches/${w.id}`, { channelId: C3, pingRoleId: null });
+    expect(r.status).toBe(403);
+    expect(r.json.error.code).toBe('forbidden');
+    expect(r.json.error.message).toMatch(/no longer has Manage Server/);
+    expect((await call(h, 'DELETE', `/watches/${w.id}`)).status).toBe(403);
+    expect((await call(h, 'POST', `/watches/${w.id}/resume`, {})).status).toBe(403);
+    expect((await call(h, 'PATCH', `/watches/${w.id}/rules`, { ignorePatterns: ['x'] })).status).toBe(403);
+    expect((await call(h, 'PATCH', `/watches/${w.id}/subdomains`, { enabled: true })).status).toBe(403);
+    expect((await call(h, 'POST', `/watches/${w.id}/subdomains/watch`, { host: 'app.hookedpad.com' })).status).toBe(403);
+    expect((await call(h, 'POST', '/watches', { url: 'unpeg.io' })).status).toBe(403);
+    expect(h.store.getWatch(w.id)?.channelId).toBe(C1);
+    expect(h.store.getWatch(w.id)?.paused).toBe(true);
+    // reads (and Check now, which the Discord card offers to everyone) still work
+    expect((await call(h, 'GET', `/watches/${w.id}`)).status).toBe(200);
+    expect((await call(h, 'GET', '/watches')).status).toBe(200);
+    expect((await call(h, 'GET', '/guild')).status).toBe(200);
+    mgr.u1 = null;
+    h.clock.t += 5 * 60_000;
+    r = await call(h, 'DELETE', `/watches/${w.id}`);
+    expect(r.status).toBe(503);
+    expect(r.headers.get('retry-after')).toBe('30');
+    expect(h.store.getWatch(w.id)).toBeTruthy();
+  });
+
+  it('offers and accepts only alert channels the creator can see', async () => {
+    const { h, w } = await manage({ creatorAccess: async () => ({ manager: true, viewable: new Set([C1, CV]) }) });
+    const g = await call(h, 'GET', '/guild');
+    expect(g.status).toBe(200);
+    expect(g.json.channels.map((c: { id: string }) => c.id)).toEqual([C1]); // C3 is hidden from the creator
+    let r = await call(h, 'PATCH', `/watches/${w.id}`, { channelId: C3 });
+    expect(r.status).toBe(400);
+    expect(r.json.error.code).toBe('invalid_channel');
+    expect(r.json.error.field).toBe('channelId');
+    expect(h.store.getWatch(w.id)?.channelId).toBe(C1);
+    expect(h.announced).toEqual([]);
+    r = await call(h, 'POST', '/watches', { url: 'unpeg.io', channelId: C3 });
+    expect(r.status).toBe(400);
+    expect(r.json.error.code).toBe('invalid_channel');
+    expect(h.store.listWatches(G1).some((x) => x.host === 'unpeg.io')).toBe(false);
+    // an unchanged channel the creator can't see is not re-checked
+    h.store.updateWatch(w.id, { channelId: C3 });
+    r = await call(h, 'PATCH', `/watches/${w.id}`, { channelId: C3, name: 'Hooked' });
+    expect(r.status).toBe(200);
+    expect(r.json.changed).toEqual(['name']);
+  });
+
+  it('takes DELETE from the manage bucket (60 per 10 min)', async () => {
+    const { h } = await manage();
+    const ids = Array.from({ length: 61 }, (_, n) => addWatch(h.store, G1, `https://s${n}.io/`, `S${n}`).id);
+    for (const id of ids.slice(0, 60)) expect((await call(h, 'DELETE', `/watches/${id}`)).status).toBe(200);
+    const r = await call(h, 'DELETE', `/watches/${ids[60]}`);
+    expect(r.status).toBe(429);
+    expect(r.json.error.code).toBe('rate_limited');
+    expect(h.store.getWatch(ids[60])).toBeTruthy();
   });
 });
