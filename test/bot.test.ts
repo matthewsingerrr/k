@@ -500,6 +500,26 @@ describe('routeInteraction', () => {
     expect(foreignModal.calls).toHaveLength(0);
   });
 
+  it('routes /link (chat input and revoke autocomplete) to the link handlers', async () => {
+    const d = routeDeps(() => ({}) as Monitor);
+    d.store.createLinkToken({ guildId: '100000000000000001', channelId: '200000000000000001', label: 'Matt Chrome', createdBy: 'u' });
+
+    const list = baseInteraction('chat', { commandName: 'link', options: { getSubcommand: () => 'list' } });
+    await routeInteraction(list.i, d);
+    expect(list.calls).toHaveLength(1);
+    expect(list.calls[0].payload.flags).toBe(64);
+    expect(JSON.stringify(list.calls[0].payload.embeds)).toContain('Matt Chrome');
+
+    const auto = baseInteraction('auto', {
+      commandName: 'link',
+      options: { getFocused: () => 'matt' },
+    });
+    await routeInteraction(auto.i, d);
+    expect(auto.calls).toHaveLength(1);
+    expect(auto.calls[0].type).toBe('respond');
+    expect(auto.calls[0].payload.map((c: { value: string }) => c.value)).toEqual(['Matt Chrome']);
+  });
+
   it('/panel without a dashboard host answers with an ephemeral error', async () => {
     const d = routeDeps(() => ({}) as Monitor);
     const { i, calls } = baseInteraction('chat', { commandName: 'panel' });

@@ -9,7 +9,8 @@
  *   Register commands: if config.discordGuildId → only that guild; else for every guild in the cache
  *   (guild.commands.set(defs)) — guild commands update instantly. Also on GuildCreate for newly joined guilds.
  *   Registration failures are logged, never fatal.
- * - InteractionCreate routing: chat input `/watch` and `/panel` → handleChatInput; autocomplete → handleAutocomplete;
+ * - InteractionCreate routing: chat input `/watch`, `/panel` and `/link` → handleChatInput (which hands `/link` to
+ *   handleLinkCommand); autocomplete for `/watch` and `/link` → handleAutocomplete;
  *   button with customId starting "watchsub:" → handleButton; dashboard buttons/selects ("panel:" custom_id) →
  *   handlePanelComponent; dashboard modal submits → handlePanelModal. Wrap each in try/catch; on error reply/followUp
  *   ephemeral if possible.
@@ -64,6 +65,7 @@ import {
   type CommandDeps,
 } from './commands.js';
 import { WATCH_SUB_PREFIX, formatAlerts, truncate, type MessagePayload } from './format.js';
+import { LINK_COMMAND_NAME } from './link.js';
 import { handlePanelComponent, handlePanelModal, isPanelCustomId, type PanelHost } from './panel.js';
 
 /**
@@ -445,11 +447,14 @@ export async function routeInteraction(interaction: Interaction, d: RouteDeps): 
   if (d.config.discordGuildId && interaction.guildId !== d.config.discordGuildId) return;
   try {
     if (interaction.isAutocomplete()) {
-      if (interaction.commandName === COMMAND_NAME) await handleAutocomplete(interaction, commandDeps(d));
+      if (interaction.commandName === COMMAND_NAME || interaction.commandName === LINK_COMMAND_NAME) {
+        await handleAutocomplete(interaction, commandDeps(d));
+      }
       return;
     }
     if (interaction.isChatInputCommand()) {
-      if (interaction.commandName === COMMAND_NAME || interaction.commandName === PANEL_COMMAND_NAME) {
+      const name = interaction.commandName;
+      if (name === COMMAND_NAME || name === PANEL_COMMAND_NAME || name === LINK_COMMAND_NAME) {
         await handleChatInput(interaction, commandDeps(d));
       }
       return;

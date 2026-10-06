@@ -341,8 +341,9 @@ describe('commandDefinitions', () => {
   const panel = defs.find((d) => d.name === 'panel');
   const subs = new Map<string, any>(cmd.options.map((o: any) => [o.name, o])); // eslint-disable-line @typescript-eslint/no-explicit-any
 
-  it('is /watch plus /panel, both guild-only and gated by Manage Server', () => {
-    expect(defs.map((d) => d.name).sort()).toEqual(['panel', 'watch']);
+  it('is /watch plus /panel plus /link, all guild-only and gated by Manage Server', () => {
+    expect(defs.map((d) => d.name).sort()).toEqual(['link', 'panel', 'watch']);
+    expect(defs[0].name).toBe('watch');
     expect(JSON.parse(JSON.stringify(defs))).toEqual(defs);
     for (const d of defs) {
       expect(d.default_member_permissions).toBe(String(PermissionFlagsBits.ManageGuild));

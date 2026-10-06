@@ -11,7 +11,9 @@
  *   /watch check   site(req, autocomplete) full:bool → defer (ephemeral), monitor.checkNow, report.
  *   /watch list    → public embed listing the server's watches.
  *   /watch help    → ephemeral help.
+ *   /link create|list|revoke → API tokens for the browser extension / other bots (see link.ts; routed to handleLinkCommand).
  * Autocomplete for `site`: guild watches filtered by id/name/host, ≤ 25 choices "name — host", value = String(id).
+ * Autocomplete for `/link revoke label` → handleLinkAutocomplete.
  * Errors → ephemeral "⚠️ <message>" (stack logged unless it is a UserError). Mutating commands re-check Manage Server.
  *
  * Buttons: `watchsub:<watchId>:<host>` (from subdomain alerts) → watch that subdomain as its own site (Manage Server).
@@ -53,6 +55,7 @@ import { isWalledOff } from '../monitor/status.js';
 import type { AlertKind, Logger, Watch, WatchFeatures, WatchState } from '../types.js';
 import { compileUrlPattern, isPathGlob, isUnderDomain, normalizeUrl, parseWatchInput, urlPath } from '../extract/url.js';
 import { ALERT_COLORS, WATCH_SUB_PREFIX, clampEmbed, codeSpan, escapeMarkdown, formatDuration, truncate } from './format.js';
+import { LINK_COMMAND_NAME, handleLinkAutocomplete, handleLinkCommand, linkCommandDefinition } from './link.js';
 import type { PanelHost } from './panel.js';
 
 export interface CommandDeps {
@@ -188,7 +191,7 @@ export function defaultInterval(config: Pick<Config, 'minIntervalSec' | 'default
 const siteOption = (o: SlashCommandStringOption) =>
   o.setName('site').setDescription('Watched site (pick from the list, or type its name, id or URL)').setRequired(true).setAutocomplete(true).setMaxLength(200);
 
-/** JSON bodies for command registration: `/watch` and `/panel`. */
+/** JSON bodies for command registration: `/watch`, `/panel` and `/link`. */
 export function commandDefinitions(config: Pick<Config, 'minIntervalSec'>): RESTPostAPIChatInputApplicationCommandsJSONBody[] {
   const minInt = minInterval(config);
   const watch = new SlashCommandBuilder()
@@ -227,7 +230,7 @@ export function commandDefinitions(config: Pick<Config, 'minIntervalSec'>): REST
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setContexts(InteractionContextType.Guild)
     .setDMPermission(false);
-  return [watch.toJSON(), panel.toJSON()];
+  return [watch.toJSON(), panel.toJSON(), linkCommandDefinition()];
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,6 +1101,7 @@ export function renderHelp(): APIEmbed {
     '`/watch list` — everything being watched',
     '`/watch check` — check right now',
     '`/watch remove` — stop watching',
+    '`/link create` — connect the browser extension (or another bot): scan any site, add it here in one click',
   ].join('\n');
   const tips = [
     'Noisy page? Add an ignore pattern under 🚫 Rules — matching text is stripped before comparing.',
@@ -1229,6 +1233,11 @@ export async function handleChatInput(interaction: ChatInputCommandInteraction, 
       await respond(interaction, { content: 'This command only works inside a server.' }, true, deps.log);
       return;
     }
+    if (interaction.commandName === LINK_COMMAND_NAME) {
+      what = `/${LINK_COMMAND_NAME}`;
+      await handleLinkCommand(interaction, deps); // replies to its own errors
+      return;
+    }
     const ctx: Ctx = { i: interaction, deps, guildId: interaction.guildId };
     if (interaction.commandName === PANEL_COMMAND_NAME) {
       what = `/${PANEL_COMMAND_NAME}`;
@@ -1250,6 +1259,10 @@ export async function handleAutocomplete(interaction: AutocompleteInteraction, d
   try {
     if (!interaction.inGuild() || !interaction.guildId) {
       await interaction.respond([]);
+      return;
+    }
+    if (interaction.commandName === LINK_COMMAND_NAME) {
+      await handleLinkAutocomplete(interaction, deps);
       return;
     }
     const focused = interaction.options.getFocused(true);

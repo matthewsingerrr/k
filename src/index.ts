@@ -8,7 +8,11 @@ import { Monitor } from './monitor/scheduler.js';
 import { startBot } from './discord/bot.js';
 import { PanelManager } from './discord/backup.js';
 import { Events } from 'discord.js';
-import { startHealthServer } from './health.js';
+import { startHealthServer, type HttpRouteHandler } from './health.js';
+import { createDnsProvider } from './net/dns.js';
+import { createCtProvider } from './monitor/subdomains.js';
+import { createLinkApi } from './link/api.js';
+import { LINK_API_PREFIX } from './link/types.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -60,7 +64,59 @@ async function main(): Promise<void> {
   void bot.ready.then(() => panels?.start()).catch((err) => log.error('dashboard start failed', { err }));
   bot.client.on(Events.GuildCreate, (guild) => void panels?.onGuildAvailable(guild).catch(() => {}));
 
-  monitor = new Monitor({ store, http, notifier: bot.notifier, config, log: log.child({ mod: 'monitor' }) });
+  // One DNS resolver and one Certificate Transparency budget for the monitor and the Link API's scans: Cert Spotter's
+  // quota is per IP, so two separate buckets would only make both run into 429s.
+  const dns = createDnsProvider();
+  const ct = createCtProvider(http, {
+    certspotterApiKey: config.certspotterApiKey,
+    queriesPerHour: config.certspotterQueriesPerHour,
+  });
+  monitor = new Monitor({ store, http, notifier: bot.notifier, config, log: log.child({ mod: 'monitor' }), providers: { ct, dns } });
+
+  // Link API (/api/v1): lets the browser extension / other bots scan sites and add them to this server's watch list.
+  let linkApi: HttpRouteHandler | null = null;
+  if (config.linkApi) {
+    const linkLog = log.child({ mod: 'link' });
+    linkApi = createLinkApi({
+      store,
+      config,
+      log: linkLog,
+      getMonitor: () => monitor,
+      scan: { http, dns, ct },
+      // A server that removed the bot can't keep using its tokens. Before the gateway is ready the guild cache is empty,
+      // so every guild counts as present until then (unavailable guilds stay in the cache during Discord outages).
+      isGuildActive: (guildId) => !bot.isReady() || bot.client.guilds.cache.has(guildId),
+      isRestoring: () => panels?.restoring() ?? true,
+      announce: async (channelId, content) => {
+        try {
+          if (!bot.isReady()) {
+            // Sites added right after a deploy: give the gateway a moment instead of dropping the notice.
+            await Promise.race([bot.ready, new Promise((r) => setTimeout(r, 30_000).unref())]);
+            if (!bot.isReady()) {
+              linkLog.info('Discord not ready — link notice skipped', { channelId });
+              return;
+            }
+          }
+          const channel = await bot.client.channels.fetch(channelId);
+          if (!channel || !channel.isSendable()) {
+            linkLog.warn('link notice: the channel is missing or the bot cannot post there', { channelId });
+            return;
+          }
+          await channel.send({ content, allowedMentions: { parse: [] } });
+        } catch (err) {
+          linkLog.warn('link notice failed', { channelId, err: err instanceof Error ? err.message : String(err) });
+        }
+      },
+    });
+    log.info(`Link API on ${config.publicUrl ?? `port ${config.port}`}${LINK_API_PREFIX}`);
+    const onRailway = Boolean(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID || process.env.RAILWAY_SERVICE_ID);
+    if (!config.publicUrl && onRailway) {
+      log.warn(
+        'This service has no public domain, so the browser extension cannot reach the Link API. ' +
+          'Railway → this service → Settings → Networking → Generate Domain (or set PUBLIC_URL), then redeploy.',
+      );
+    }
+  }
 
   const health = startHealthServer(
     config.port,
@@ -72,6 +128,7 @@ async function main(): Promise<void> {
       httpStats: () => http.stats(),
     },
     log,
+    { linkApi },
   );
 
   // Start monitoring right away; alerts are queued until the Discord client is ready.

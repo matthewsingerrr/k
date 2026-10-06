@@ -79,6 +79,9 @@ Slash commands for quick use (Manage Server only):
 /watch check site:Unpeg [full]
 /watch list
 /watch help
+/link create label:"Matt's Chrome" [channel]   # API token for the browser extension / another bot (shown once)
+/link list
+/link revoke label:"Matt's Chrome"
 ```
 
 Subdomain alerts have a **Watch <host>** button that starts watching that subdomain as its own site.
@@ -112,6 +115,29 @@ When the site lets the bot back in, it says so and returns to normal speed. The 
   - *DNS sweep* of about 250 common names every 15 min. Public resolvers cache "does not exist" answers for the zone's negative TTL (typically 30–60 minutes), so a brand-new name can take up to the sweep interval plus that TTL to show up this way.
   - In zones with a wildcard DNS record that rotates its addresses (Vercel DNS, CloudFront aliases), the DNS sweep can't tell real names from the wildcard and relies on the other sources.
 
+## Link API / browser extension
+
+The bot can be driven from outside Discord. The **Arkham Dev Tags** Chrome extension, another bot or a script talks to it over HTTPS:
+- **🔎 Scan** any website: tech stack grouped by category, hosting, build id, subdomains, API endpoints and socials.
+- **➕ Add to Discord tracker** in one click: the site is added to your server's watch list and its alerts land in your channel.
+- See whether the current site is already tracked, remove it, trigger a check, and poll the alert feed (desktop notifications).
+
+The two projects stay separate: two repos, two deploys. The extension calls this bot's **Link API** (`/api/v1`) on the bot's Railway domain, using a token issued in Discord. No shared secret is built into the extension.
+
+**Set it up:**
+1. **Give the bot a public domain.** In Railway, open this service → **Settings** → **Networking** → **Generate Domain**, then redeploy. The bot picks up `RAILWAY_PUBLIC_DOMAIN` automatically. For a custom domain or proxy, set `PUBLIC_URL`. The API is served by the same HTTP server as `/health`, so it needs no extra port or service.
+2. **Create a link in Discord.** Run `/link create label:"Matt's Chrome"` (Manage Server). Add `channel:#alerts` to choose where sites added through it post; the default is the current channel.
+   - The private reply shows the **API URL** and a **token** (`swb_…`). The token is **shown once**; only its hash is stored.
+   - Each person or device should get its own link: up to 10 per server, each revocable on its own with `/link revoke`.
+   - `/link list` shows each link's channel and when it was last used.
+3. **Paste both into the extension:** options → **Discord tracker** → **Test connection**.
+
+Links survive redeploys: the token hashes ride along in the dashboard's watch-list backup. A revoked token stops working immediately; sites it added stay watched.
+
+**Docs:**
+- [`INTEGRATION.md`](INTEGRATION.md) is the full API reference: auth, CORS, rate limits, errors, every endpoint with JSON examples, and curl.
+- [`HANDOFF-EXTENSION.md`](HANDOFF-EXTENSION.md) is a self-contained brief for whoever maintains the extension. It covers the options page, the service-worker client, the on-page panel, notifications and the test plan.
+
 ## Configuration (environment variables)
 
 | Variable | Default | Notes |
@@ -132,7 +158,10 @@ When the site lets the bot back in, it says so and returns to normal speed. The 
 | `USER_AGENT` | recent desktop Chrome | |
 | `LOG_LEVEL` | info | debug / info / warn / error |
 | `ANNOUNCE_UPDATES` | true | Post "Ver X has been updated!" after a deploy |
-| `PORT` | 3000 (Railway sets it) | `/health` endpoint |
+| `PORT` | 3000 (Railway sets it) | `/health` endpoint and the Link API |
+| `PUBLIC_URL` | `https://$RAILWAY_PUBLIC_DOMAIN` | Public base URL of this service, shown by `/link create` (the API lives at `<PUBLIC_URL>/api/v1`). Only needed for a custom domain or proxy |
+| `LINK_API` | true | Serve the Link API (`/api/v1`) for the browser extension and other bots. `false` turns it off; tokens are kept |
+| `ALLOW_PRIVATE_NETWORK` | false | Let the bot fetch private / loopback / internal addresses (self-hosting and tests only). It also lets Link API clients scan and add such hosts, so **keep it off on Railway** |
 
 ## Local development
 

@@ -7,6 +7,10 @@
  * (fresh database), it looks for its own latest backup message in the guild's channels and restores the watches from
  * it; restored watches run a silent baseline first, so a redeploy never floods the channel.
  *
+ * Link API tokens (/link create) ride along as sha256 hashes only — the attachment is visible to everyone in the
+ * channel, and a hash of a 256-bit random token can't be turned back into a usable token — so linked browser
+ * extensions keep working after a redeploy without a volume.
+ *
  * Safety: nothing is ever posted or edited for a guild before its restore check finished, so an empty fresh database
  * can never overwrite a good backup.
  */
@@ -14,7 +18,7 @@
 import { createHash } from 'node:crypto';
 import { AttachmentBuilder, ChannelType, type Client, type Guild, type Message } from 'discord.js';
 import type { Config } from '../config.js';
-import type { Store } from '../db/store.js';
+import type { LinkToken, Store } from '../db/store.js';
 import type { Monitor } from '../monitor/scheduler.js';
 import type { Logger, Watch, WatchFeatures } from '../types.js';
 import { buildPanelMessage, PANEL_COLOR, type PanelHost, type PanelMessage } from './panel.js';
@@ -52,6 +56,16 @@ export interface BackupWatch {
   createdAt: number;
 }
 
+/** A Link API token as backed up: its sha256 hash only, never the token itself. */
+export interface BackupLink {
+  label: string;
+  channelId: string;
+  /** sha256 hex of the token (64 lowercase hex chars). */
+  tokenHash: string;
+  createdBy: string;
+  createdAt: number;
+}
+
 export interface BackupFile {
   version: number;
   guildId: string;
@@ -59,14 +73,35 @@ export interface BackupFile {
   /** BUILD_ID last announced in the guild, so a fresh container doesn't re-announce the same deploy. */
   announcedVersion?: string | null;
   watches: BackupWatch[];
+  /** Link API tokens (hashes). Optional: older backups have none, and older code ignores the field. */
+  links?: BackupLink[];
 }
 
-export function toBackup(guildId: string, watches: Watch[], now = new Date(), announcedVersion: string | null = null): BackupFile {
+/** Most link tokens restored from one backup (a guild normally has a handful). */
+export const MAX_BACKUP_LINKS = 100;
+const MAX_LINK_LABEL_CHARS = 100;
+const TOKEN_HASH_RE = /^[0-9a-f]{64}$/;
+const SNOWFLAKE_RE = /^\d{1,25}$/;
+
+export function toBackup(
+  guildId: string,
+  watches: Watch[],
+  now = new Date(),
+  announcedVersion: string | null = null,
+  links: ReadonlyArray<Pick<LinkToken, 'label' | 'channelId' | 'tokenHash' | 'createdBy' | 'createdAt'>> = [],
+): BackupFile {
   return {
     version: BACKUP_VERSION,
     guildId,
     exportedAt: now.toISOString(),
     announcedVersion,
+    links: links.map((l) => ({
+      label: l.label,
+      channelId: l.channelId,
+      tokenHash: l.tokenHash,
+      createdBy: l.createdBy,
+      createdAt: l.createdAt,
+    })),
     watches: watches.map((w) => ({
       name: w.name,
       url: w.url,
@@ -137,7 +172,34 @@ export function parseBackup(text: string): BackupFile | null {
     exportedAt: str(r.exportedAt) ? r.exportedAt : '',
     announcedVersion: str(r.announcedVersion) ? r.announcedVersion : null,
     watches,
+    links: parseLinks(r.links),
   };
+}
+
+/** Valid link entries (64-hex hash, numeric channel id, non-empty label), deduped by hash, at most MAX_BACKUP_LINKS. */
+function parseLinks(raw: unknown): BackupLink[] {
+  if (!Array.isArray(raw)) return [];
+  const out: BackupLink[] = [];
+  const seen = new Set<string>();
+  for (const e of raw as unknown[]) {
+    if (out.length >= MAX_BACKUP_LINKS) break;
+    if (!e || typeof e !== 'object') continue;
+    const l = e as Record<string, unknown>;
+    const hash = typeof l.tokenHash === 'string' ? l.tokenHash.trim().toLowerCase() : '';
+    if (!TOKEN_HASH_RE.test(hash) || seen.has(hash)) continue;
+    if (typeof l.channelId !== 'string' || !SNOWFLAKE_RE.test(l.channelId)) continue;
+    const label = typeof l.label === 'string' ? l.label.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, MAX_LINK_LABEL_CHARS) : '';
+    if (!label) continue;
+    seen.add(hash);
+    out.push({
+      label,
+      channelId: l.channelId,
+      tokenHash: hash,
+      createdBy: str(l.createdBy) ? l.createdBy.slice(0, 100) : 'restore',
+      createdAt: typeof l.createdAt === 'number' && Number.isFinite(l.createdAt) ? l.createdAt : Date.now(),
+    });
+  }
+  return out;
 }
 
 function sha1(s: string): string {
@@ -182,11 +244,29 @@ export class PanelManager implements PanelHost {
 
   constructor(private readonly deps: PanelManagerDeps) {}
 
+  private startDone = false;
+  private readonly bornAt = Date.now();
+
+  /**
+   * True until every guild the bot is in finished its restore check after this start (link API answers 503 meanwhile).
+   * Capped at 5 minutes so a stuck restore can't hide a genuinely revoked token forever.
+   */
+  restoring(): boolean {
+    if (this.stopped || Date.now() - this.bornAt > 5 * 60_000) return false;
+    if (!this.startDone) return true;
+    for (const id of this.deps.client.guilds.cache.keys()) if (!this.checked.has(id)) return true;
+    return false;
+  }
+
   /** Call once the Discord client is ready: restore missing guilds, then keep dashboards in sync. */
   async start(): Promise<void> {
     this.unsubscribe = this.deps.store.onWatchesChanged((guildId) => this.schedule(guildId, false));
+    try {
+      for (const guild of this.deps.client.guilds.cache.values()) await this.ensureRestored(guild);
+    } finally {
+      this.startDone = true;
+    }
     for (const guild of this.deps.client.guilds.cache.values()) {
-      await this.ensureRestored(guild);
       await this.announceUpdate(guild.id).catch((err) =>
         this.deps.log.warn('update announcement failed', { guildId: guild.id, err: String(err) }),
       );
@@ -306,7 +386,16 @@ export class PanelManager implements PanelHost {
         log.warn('could not restore a watch from the backup', { guildId, url: b.url, err: String(err) });
       }
     }
-    log.info(`restored ${restored} watch(es) from the Discord backup`, { guildId, exportedAt: backup.exportedAt });
+    let links = 0;
+    for (const l of backup.links ?? []) {
+      try {
+        store.importLinkToken({ guildId, channelId: l.channelId, label: l.label, tokenHash: l.tokenHash, createdBy: l.createdBy, createdAt: l.createdAt, lastUsedAt: null });
+        links++;
+      } catch (err) {
+        log.warn('could not restore a link token from the backup', { guildId, label: l.label, err: String(err) });
+      }
+    }
+    log.info(`restored ${restored} watch(es) and ${links} link token(s) from the Discord backup`, { guildId, exportedAt: backup.exportedAt });
   }
 
   /** Newest backup message authored by this bot in the guild (pinned messages first, then recent history). */
@@ -392,10 +481,11 @@ export class PanelManager implements PanelHost {
         return;
       }
     }
-    // No dashboard yet (or its channel is gone): put it where the first site's alerts go.
-    if (!watches.length) return;
-    for (const w of watches) {
-      const channel = await this.sendableChannel(w.channelId);
+    // No dashboard yet (or its channel is gone): put it where the first site's alerts go — or, for a server that only
+    // has link tokens so far, where the first link posts (so the tokens are backed up too).
+    const candidates = [...new Set([...watches.map((w) => w.channelId), ...store.listLinkTokens(guildId).map((l) => l.channelId)])];
+    for (const channelId of candidates) {
+      const channel = await this.sendableChannel(channelId);
       if (channel) {
         await this.post(guildId, channel);
         return;
@@ -408,10 +498,12 @@ export class PanelManager implements PanelHost {
   }
 
   private backupFile(guildId: string): { json: string; hash: string } {
-    const announced = this.deps.store.getGuildSettings(guildId)?.announcedVersion ?? null;
-    const backup = toBackup(guildId, this.deps.store.listWatches(guildId), new Date(), announced);
+    const { store } = this.deps;
+    const announced = store.getGuildSettings(guildId)?.announcedVersion ?? null;
+    const backup = toBackup(guildId, store.listWatches(guildId), new Date(), announced, store.listLinkTokens(guildId));
     const json = JSON.stringify(backup, null, 2);
-    return { json, hash: sha1(JSON.stringify([backup.announcedVersion, backup.watches])) };
+    // Token create/revoke changes the hash (lastUsedAt is not backed up, so token use does not).
+    return { json, hash: sha1(JSON.stringify([backup.announcedVersion, backup.watches, backup.links ?? []])) };
   }
 
   /**

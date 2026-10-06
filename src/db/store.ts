@@ -890,6 +890,11 @@ export class Store {
   // --- subdomains ------------------------------------------------------------
 
   /** Ordered by host. */
+  countSubdomains(watchId: number): number {
+    const row = this.stmt(`SELECT COUNT(*) AS n FROM subdomains WHERE watch_id = ?`).get(watchId) as { n: number } | undefined;
+    return row?.n ?? 0;
+  }
+
   listSubdomains(watchId: number): SubdomainRecord[] {
     const rows = this.stmt(`SELECT * FROM subdomains WHERE watch_id = ? ORDER BY host`).all(watchId) as SubdomainRow[];
     return rows.map(rowToSubdomain);
