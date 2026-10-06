@@ -50,6 +50,10 @@ export interface Config {
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   /** Post "Ver X has been updated! Enjoy" in each server after a deploy of new code. */
   announceUpdates: boolean;
+  /** Public base URL of this service (PUBLIC_URL, else https://$RAILWAY_PUBLIC_DOMAIN), shown by /link; null if unknown. */
+  publicUrl: string | null;
+  /** Serve the Link API (/api/v1) for the browser extension & other bots. */
+  linkApi: boolean;
 }
 
 function int(name: string, fallback: number, min = 0): number {
@@ -119,6 +123,10 @@ export function loadConfig(opts: { requireToken?: boolean } = {}): Config {
     confirmDelayMs: int('CONFIRM_DELAY_MS', 2500, 0),
     logLevel: ['debug', 'info', 'warn', 'error'].includes(level) ? level : 'info',
     announceUpdates: bool('ANNOUNCE_UPDATES', true),
+    publicUrl:
+      process.env.PUBLIC_URL?.trim().replace(/\/+$/, '') ||
+      (process.env.RAILWAY_PUBLIC_DOMAIN?.trim() ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN.trim()}` : null),
+    linkApi: bool('LINK_API', true),
   };
 }
 
@@ -152,6 +160,8 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     confirmDelayMs: 0,
     logLevel: 'warn',
     announceUpdates: false,
+    publicUrl: null,
+    linkApi: true,
     ...overrides,
   };
 }

@@ -15,6 +15,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
+import { createHash, randomBytes } from 'node:crypto';
 import {
   DEFAULT_FEATURES,
   defaultWatchState,
@@ -47,7 +48,7 @@ export const MAX_STORED_TEXT_CHARS = 500_000;
 /** Event summaries are capped at this many chars. */
 const MAX_EVENT_SUMMARY_CHARS = 4000;
 /** Current schema version (= number of migrations). */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 const BUILTIN_DEFAULTS: StoreDefaults = { intervalSec: 2, sweepSec: 120, maxPages: 150 };
 
@@ -176,7 +177,78 @@ const MIGRATIONS: Array<(db: Db) => void> = [
     const cols = new Set((db.prepare(`PRAGMA table_info(guild_settings)`).all() as Array<{ name: string }>).map((c) => c.name));
     if (!cols.has('announced_version')) db.exec(`ALTER TABLE guild_settings ADD COLUMN announced_version TEXT`);
   },
+  // v5: API link tokens (browser extension / other services → this bot), stored as sha256 hashes only
+  (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS link_tokens (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        label TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        created_by TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_used_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS link_tokens_guild ON link_tokens(guild_id);
+    `);
+  },
 ];
+
+/** A credential that lets an outside client (the browser extension, another bot) act on one guild's watch list. */
+export interface LinkToken {
+  id: number;
+  guildId: string;
+  /** Where sites added through this link post their alerts. */
+  channelId: string;
+  label: string;
+  /** sha256 hex of the token; the token itself is shown once and never stored. */
+  tokenHash: string;
+  createdBy: string;
+  createdAt: number;
+  lastUsedAt: number | null;
+}
+
+/** Guild-wide event (alert history) row with its site's name, for the link API's event feed. */
+export interface GuildEventRecord {
+  id: number;
+  watchId: number;
+  watchName: string;
+  watchUrl: string;
+  kind: AlertKind;
+  summary: string;
+  createdAt: number;
+}
+
+export const LINK_TOKEN_PREFIX = 'swb_';
+
+export function hashLinkToken(token: string): string {
+  return createHash('sha256').update(String(token).trim(), 'utf8').digest('hex');
+}
+
+type LinkTokenRow = {
+  id: number;
+  guild_id: string;
+  channel_id: string;
+  label: string;
+  token_hash: string;
+  created_by: string;
+  created_at: number;
+  last_used_at: number | null;
+};
+
+function linkFromRow(r: LinkTokenRow): LinkToken {
+  return {
+    id: r.id,
+    guildId: r.guild_id,
+    channelId: r.channel_id,
+    label: r.label,
+    tokenHash: r.token_hash,
+    createdBy: r.created_by,
+    createdAt: r.created_at,
+    lastUsedAt: r.last_used_at,
+  };
+}
 
 export interface GuildSettings {
   guildId: string;
@@ -885,6 +957,80 @@ export class Store {
   }
 
   /** Newest first. */
+  // --- link tokens (outside clients) ------------------------------------------
+
+  /** Create a link token for a guild. Returns the plain token (show it once) and the stored record. */
+  createLinkToken(input: { guildId: string; channelId: string; label: string; createdBy: string }): { token: string; record: LinkToken } {
+    const token = LINK_TOKEN_PREFIX + randomBytes(32).toString('base64url');
+    const record = this.importLinkToken({ ...input, tokenHash: hashLinkToken(token), createdAt: Date.now(), lastUsedAt: null });
+    return { token, record };
+  }
+
+  /** Insert an already-hashed token (restore from a backup). Existing hashes are left alone. */
+  importLinkToken(t: Omit<LinkToken, 'id'>): LinkToken {
+    this.stmt(
+      `INSERT INTO link_tokens (guild_id, channel_id, label, token_hash, created_by, created_at, last_used_at)
+       VALUES (@guildId, @channelId, @label, @tokenHash, @createdBy, @createdAt, @lastUsedAt)
+       ON CONFLICT(token_hash) DO NOTHING`,
+    ).run({ ...t, guildId: String(t.guildId), channelId: String(t.channelId), lastUsedAt: t.lastUsedAt ?? null });
+    const row = this.stmt(`SELECT * FROM link_tokens WHERE token_hash = ?`).get(t.tokenHash) as LinkTokenRow;
+    this.emitWatchesChanged(row.guild_id); // the Discord backup carries link tokens (hashes) too
+    return linkFromRow(row);
+  }
+
+  /** Look up a presented token (by hash). */
+  findLinkToken(token: string): LinkToken | undefined {
+    if (typeof token !== 'string' || !token.startsWith(LINK_TOKEN_PREFIX) || token.length > 200) return undefined;
+    const row = this.stmt(`SELECT * FROM link_tokens WHERE token_hash = ?`).get(hashLinkToken(token)) as LinkTokenRow | undefined;
+    return row ? linkFromRow(row) : undefined;
+  }
+
+  listLinkTokens(guildId: string): LinkToken[] {
+    return (this.stmt(`SELECT * FROM link_tokens WHERE guild_id = ? ORDER BY id`).all(String(guildId)) as LinkTokenRow[]).map(linkFromRow);
+  }
+
+  /** Revoke by id or (case-insensitive) label within a guild. Returns how many tokens were removed. */
+  revokeLinkToken(guildId: string, idOrLabel: string | number): number {
+    const key = String(idOrLabel).trim();
+    const info = /^\d+$/.test(key)
+      ? this.stmt(`DELETE FROM link_tokens WHERE guild_id = ? AND id = ?`).run(String(guildId), Number(key))
+      : this.stmt(`DELETE FROM link_tokens WHERE guild_id = ? AND lower(label) = lower(?)`).run(String(guildId), key);
+    if (info.changes > 0) this.emitWatchesChanged(String(guildId));
+    return info.changes;
+  }
+
+  touchLinkToken(id: number, now: number): void {
+    this.stmt(`UPDATE link_tokens SET last_used_at = ? WHERE id = ?`).run(now, id);
+  }
+
+  /** Alert history of every watch in a guild with id > sinceId, oldest first (for polling clients). */
+  listGuildEvents(guildId: string, sinceId: number, limit: number): GuildEventRecord[] {
+    const n = Math.max(0, Math.min(500, Math.floor(finite(limit, 0))));
+    if (n === 0) return [];
+    const rows = this.stmt(
+      `SELECT e.id, e.watch_id, e.kind, e.summary, e.created_at, w.name AS watch_name, w.url AS watch_url
+       FROM events e JOIN watches w ON w.id = e.watch_id
+       WHERE w.guild_id = ? AND e.id > ? ORDER BY e.id ASC LIMIT ?`,
+    ).all(String(guildId), Math.max(0, Math.floor(finite(sinceId, 0))), n) as Array<{
+      id: number;
+      watch_id: number;
+      kind: string;
+      summary: string;
+      created_at: number;
+      watch_name: string;
+      watch_url: string;
+    }>;
+    return rows.map((r) => ({
+      id: r.id,
+      watchId: r.watch_id,
+      watchName: r.watch_name,
+      watchUrl: r.watch_url,
+      kind: r.kind as AlertKind,
+      summary: r.summary,
+      createdAt: r.created_at,
+    }));
+  }
+
   listEvents(watchId: number, limit: number): EventRecord[] {
     const n = Math.max(0, Math.floor(finite(limit, 0)));
     if (n === 0) return [];
