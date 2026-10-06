@@ -20,6 +20,8 @@ export type HttpRouteHandler = (req: http.IncomingMessage, res: http.ServerRespo
 export interface HealthServerOptions {
   /** Link API (/api/v1, see src/link/api.ts); absent when LINK_API is off. */
   linkApi?: HttpRouteHandler | null;
+  /** Interface to listen on (default: all, as Railway needs); the local dev server uses 127.0.0.1. */
+  host?: string;
 }
 
 /** Whole request (headers + body) must arrive within this long; slow-loris clients are cut off. */
@@ -103,6 +105,8 @@ export function startHealthServer(port: number, src: HealthSource, log: Logger, 
   // Malformed requests and header/request timeouts get Node's default 400/408/431 answer (no 'clientError' override).
   server.maxConnections = MAX_CONNECTIONS;
   server.on('error', (err) => log.warn('health server error', { err }));
-  server.listen(port, () => log.info(`health server listening on :${port}`));
+  const onListening = () => log.info(`health server listening on ${opts.host ?? ''}:${port}`);
+  if (opts.host) server.listen(port, opts.host, onListening);
+  else server.listen(port, onListening);
   return server;
 }
