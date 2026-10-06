@@ -8,6 +8,7 @@ The extension gets a **Site Watcher panel** that works on any website:
 - **🔎 Scan** shows what the site is built with: tech grouped by category, hosting, build id, subdomains, API endpoints and socials.
 - **➕ Add to Discord tracker** adds the site to the bot's watch list. The bot then posts redeploys, text changes, new pages, new subdomains and downtime for that site in Discord, 24/7.
 - When the site is already tracked, the panel shows **✅ Tracked** with a **Remove** button.
+- **Manage** a tracked site like the Discord dashboard: its card (status, schedule, alerts, build, pages, subdomains, rules, checks, runtime), Check now, Pause / Resume, Settings (name, interval, full sweep, alert channel, ping role), the 8 check switches, Rules, Pages, Subdomains (with "watch this subdomain") and History, plus the server's site list. A token has the dashboard's rights for **its own server only** (it was created by a Manage Server member).
 - Optionally, the extension mirrors the Discord alerts as desktop notifications.
 
 The bot (separate repo, separate Railway service) already exposes an HTTPS JSON API for this, the **Link API v1**. **Nothing changes in your own backend or Railway service** (if you have one), and nothing changes in your release flow. The extension talks straight to the bot:
@@ -104,6 +105,8 @@ function swbErrorText(e) {
     case 'limit_reached': return 'That Discord server already watches its maximum number of sites. Remove one first.';
     case 'invalid_url': return "This page can't be scanned or tracked (it must be a public http(s) website).";
     case 'scan_failed': return e.message || 'The scan failed. Try again.'; // the bot's message already says so
+    // Management validation: the bot's message says exactly what to fix (plain text).
+    case 'invalid_pattern': case 'invalid_channel': case 'invalid_role': case 'name_taken': return e.message || 'The bot refused that change.';
     case 'timeout': case 'client_timeout': return 'The bot took too long to answer. Try again.';
     case 'offline': return 'You are offline.';
     case 'network': return "Can't reach the bot (it may be redeploying). Try again in a minute.";
@@ -112,8 +115,17 @@ function swbErrorText(e) {
 }
 
 // Per-bucket back-off after 429 (in memory; the server re-sends 429 if the worker restarted).
+// The 30 s "checked too recently" 429 of POST /watches/:id/check concerns ONE site: key it check:<id>, never 'all',
+// or a single cooldown would block every call for 30 s. Management writes have their own 60-per-10-min bucket.
 const swbBackoff = new Map();
-const swbBucket = (method, path) => (method === 'POST' && path === '/scan' ? 'scan' : method === 'POST' && path === '/watches' ? 'add' : 'all');
+function swbBucket(method, path) {
+  const check = /^\/watches\/(\d+)\/check$/.exec(path);
+  if (method === 'POST' && check) return `check:${check[1]}`;
+  if (method === 'POST' && path === '/scan') return 'scan';
+  if (method === 'POST' && (path === '/watches' || /^\/watches\/\d+\/subdomains\/watch$/.test(path))) return 'add';
+  if (method === 'PATCH' || (method === 'POST' && /^\/watches\/\d+\/(pause|resume)$/.test(path))) return 'manage';
+  return 'all';
+}
 
 async function swbFetch(method, path, body, { timeoutMs = 20000 } = {}) {
   const { swbApiUrl: base, swbToken: token } = await chrome.storage.local.get(['swbApiUrl', 'swbToken']);
@@ -143,7 +155,7 @@ async function swbFetch(method, path, body, { timeoutMs = 20000 } = {}) {
   if (res.status === 429) {
     // Retry-After is exposed via Access-Control-Expose-Headers; default to 60 s if a proxy strips it.
     const s = Math.max(1, Number(res.headers.get('Retry-After')) || 60);
-    swbBackoff.set(bucket, Date.now() + s * 1000);
+    swbBackoff.set(bucket, Date.now() + s * 1000); // per bucket: a site's check cooldown never blocks other calls
     throw new SwbError('rate_limited', message, 429, s);
   }
   if (res.status === 401) {
@@ -161,6 +173,35 @@ function swbSite(msg, sender) {
   return u.origin + '/';
 }
 function swbId(id) { const n = Number(id); if (!Number.isInteger(n) || n <= 0) throw new SwbError('bad_request', 'Bad watch id'); return n; }
+
+/** Forward only known keys with the right JSON types (the bot re-validates everything; this keeps junk out of requests). */
+const SWB_SETTINGS = { name: 'string', intervalSec: 'number', sweepSec: 'number', channelId: 'string', pingRoleId: 'string|null', paused: 'boolean' };
+const SWB_CHECKS = ['deploy', 'text', 'pages', 'subdomains', 'files', 'status', 'codeIntel', 'maskNumbers'];
+const swbIs = (v, t) => t.split('|').some((x) => (x === 'null' ? v === null : typeof v === x && (x !== 'number' || Number.isFinite(v))));
+function swbSettingsPatch(p) {
+  const out = {};
+  for (const [k, t] of Object.entries(SWB_SETTINGS)) if (p && k in p) { if (!swbIs(p[k], t)) throw new SwbError('bad_request', `Bad ${k}`); out[k] = p[k]; }
+  if (p && p.checks !== undefined) {
+    out.checks = {};
+    for (const k of SWB_CHECKS) if (k in p.checks) { if (typeof p.checks[k] !== 'boolean') throw new SwbError('bad_request', `Bad check ${k}`); out.checks[k] = p.checks[k]; }
+  }
+  return out;
+}
+function swbRulesPatch(p) {
+  const out = {};
+  const strings = (a) => Array.isArray(a) && a.every((x) => typeof x === 'string');
+  for (const k of ['ignorePatterns', 'excludePatterns', 'extraUrls']) {
+    if (!p || !(k in p)) continue;
+    const v = p[k];
+    if (strings(v)) out[k] = v;
+    else if (v && typeof v === 'object' && (v.add === undefined || strings(v.add)) && (v.remove === undefined || strings(v.remove))) out[k] = { ...(v.add ? { add: v.add } : {}), ...(v.remove ? { remove: v.remove } : {}) };
+    else throw new SwbError('bad_request', `Bad ${k}`);
+  }
+  if (p && 'scopePath' in p) { if (!swbIs(p.scopePath, 'string|null')) throw new SwbError('bad_request', 'Bad scopePath'); out.scopePath = p.scopePath; }
+  if (p && 'maxPages' in p) { if (!Number.isInteger(p.maxPages)) throw new SwbError('bad_request', 'Bad maxPages'); out.maxPages = p.maxPages; }
+  return out;
+}
+const swbQuery = (o) => { const q = new URLSearchParams(); for (const [k, v] of Object.entries(o)) if (v !== undefined && v !== null && v !== '') q.set(k, String(v)); const s = q.toString(); return s ? `?${s}` : ''; };
 
 /** Highest event id on the bot (pages through the feed). */
 async function swbLatestEventId() {
@@ -229,9 +270,24 @@ async function swbHandle(msg, sender) {
     }
     case 'swb:scan':   return swbFetch('POST', '/scan', { url: swbSite(msg, sender), subdomains: ['none', 'quick', 'full'].includes(msg.subdomains) ? msg.subdomains : 'quick' }, { timeoutMs: 60000 }); // the bot gives up at 50 s
     case 'swb:status': return swbFetch('GET', `/watches?url=${encodeURIComponent(swbSite(msg, sender))}`);
-    case 'swb:add':    return swbFetch('POST', '/watches', { url: swbSite(msg, sender), ...(msg.name ? { name: String(msg.name).slice(0, 100) } : {}) });
+    case 'swb:add':    return swbFetch('POST', '/watches', { url: swbSite(msg, sender), ...(msg.name ? { name: String(msg.name).slice(0, 100) } : {}),
+                          ...(typeof msg.channelId === 'string' ? { channelId: msg.channelId } : {}), ...(typeof msg.pingRoleId === 'string' ? { pingRoleId: msg.pingRoleId } : {}) });
     case 'swb:remove': return swbFetch('DELETE', `/watches/${swbId(msg.id)}`);
-    case 'swb:check':  return swbFetch('POST', `/watches/${swbId(msg.id)}/check`, {}, { timeoutMs: 70000 });
+    case 'swb:check':  return swbFetch('POST', `/watches/${swbId(msg.id)}/check`, { full: msg.full === true }, { timeoutMs: 70000 });
+    // Management (the Discord card and its buttons)
+    case 'swb:list':   return swbFetch('GET', '/watches');
+    case 'swb:card':   return swbFetch('GET', `/watches/${swbId(msg.id)}`);
+    case 'swb:update': return swbFetch('PATCH', `/watches/${swbId(msg.id)}`, swbSettingsPatch(msg.patch));
+    case 'swb:pause':  return swbFetch('POST', `/watches/${swbId(msg.id)}/pause`, {});
+    case 'swb:resume': return swbFetch('POST', `/watches/${swbId(msg.id)}/resume`, {});
+    case 'swb:rules':  return swbFetch('GET', `/watches/${swbId(msg.id)}/rules`);
+    case 'swb:setRules': return swbFetch('PATCH', `/watches/${swbId(msg.id)}/rules`, swbRulesPatch(msg.patch));
+    case 'swb:pages':  return swbFetch('GET', `/watches/${swbId(msg.id)}/pages${swbQuery({ list: ['tracked', 'untracked', 'files'].includes(msg.list) ? msg.list : undefined, limit: msg.limit, offset: msg.offset })}`);
+    case 'swb:subdomains': return swbFetch('GET', `/watches/${swbId(msg.id)}/subdomains${swbQuery({ limit: msg.limit, offset: msg.offset })}`);
+    case 'swb:setSubdomains': return swbFetch('PATCH', `/watches/${swbId(msg.id)}/subdomains`, { enabled: msg.enabled === true });
+    case 'swb:watchSubdomain': return swbFetch('POST', `/watches/${swbId(msg.id)}/subdomains/watch`, { host: String(msg.host || '').slice(0, 253) });
+    case 'swb:history': return swbFetch('GET', `/watches/${swbId(msg.id)}/history${swbQuery({ limit: msg.limit, before: msg.before })}`);
+    case 'swb:guild':  return swbFetch('GET', '/guild');
     case 'swb:resyncEvents': return swbResyncEvents();
     case 'swb:openOptions':  return chrome.runtime.openOptionsPage();
     case 'swb:openPanel': { const [tab] = await chrome.tabs.query({ active: true, currentWindow: true }); return swbOpenPanel(tab); }
@@ -272,13 +328,31 @@ chrome.notifications?.onClicked.addListener(async (id) => {
 | `swb:ping` | — | `PingResponse` (Appendix) |
 | `swb:scan` | `{ url?, subdomains?: "none"\|"quick"\|"full" }` | `ScanResult` |
 | `swb:status` | `{ url? }` | `{ watches: ApiWatch[], watched: boolean }` |
-| `swb:add` | `{ url?, name? }` | `{ created: boolean, watch: ApiWatch }` |
+| `swb:add` | `{ url?, name?, channelId?, pingRoleId? }` | `{ created: boolean, watch: ApiWatch }` |
 | `swb:remove` | `{ id }` | `{ deleted: true }` |
-| `swb:check` | `{ id }` | `{ alerts, kinds, error }` |
+| `swb:check` | `{ id, full? }` | `{ alerts, kinds, error }` |
+| `swb:list` | — | `{ watches: ApiWatch[], summary: ApiServerSummary }` (`GET /watches`) |
+| `swb:card` | `{ id }` | `{ watch, card: ApiCard, events, limits }` (`GET /watches/:id`) |
+| `swb:update` | `{ id, patch }` | `ApiManageResult` (`PATCH /watches/:id`) |
+| `swb:pause` / `swb:resume` | `{ id }` | `ApiManageResult` (`POST …/pause` / `…/resume`) |
+| `swb:rules` | `{ id }` | `{ rules: ApiRules, limits }` (`GET …/rules`) |
+| `swb:setRules` | `{ id, patch }` | `ApiManageResult & { rules }` (`PATCH …/rules`) |
+| `swb:pages` | `{ id, list?, limit?, offset? }` | pages response (`GET …/pages`) |
+| `swb:subdomains` | `{ id, limit?, offset? }` | subdomains response (`GET …/subdomains`) |
+| `swb:setSubdomains` | `{ id, enabled }` | `ApiManageResult` (`PATCH …/subdomains`) |
+| `swb:watchSubdomain` | `{ id, host }` | `{ created, watch }` (`POST …/subdomains/watch`) |
+| `swb:history` | `{ id, limit?, before? }` | `{ events, nextBefore }` (`GET …/history`) |
+| `swb:guild` | — | `ApiGuildInfo` (`GET /guild`) |
 | `swb:resyncEvents` | — | `{ cursor }` |
 | `swb:openOptions`, `swb:openPanel` | — | — |
 
 `url` defaults to the sender tab and is always reduced to its origin, so a scan or add of `https://hookedpad.com/app?x=1` uses `https://hookedpad.com/`.
+
+Rules for the management messages:
+- The worker forwards only the known keys of `patch`, re-checking their JSON types (`swbSettingsPatch`, `swbRulesPatch`); the bot validates everything again and answers `400` with `field` for anything it refuses.
+- `id` always goes through `swbId()`.
+- Like every `swb:*` message, they are answered only for the extension's own pages (`sender.id === chrome.runtime.id`); content scripts on websites must never be able to change Discord settings.
+- Render `card`, page titles, subdomain probes and channel / role names as text: they come from websites and from Discord.
 
 ## 5. Options page: "Discord tracker" section
 
@@ -528,8 +602,11 @@ The code in §4 handles this:
 | Token revoked / wrong, or the bot left that server | `401 unauthorized` | "Re-link in Discord with /link create" + **Open options**; set `swbLink.broken`; stop polling |
 | Too many requests | `429 rate_limited` + `Retry-After` | Disable that button and count down `retryAfter` (default 60 s). Back-off is per bucket: scan / add / everything. |
 | Server at its site limit | `409 limit_reached` | Show the message |
+| A management change was refused | `400 invalid_pattern` / `invalid_channel` / `invalid_role`, `409 name_taken` (`error.field` names the input) | Show the bot's message next to that input; nothing was saved |
+| Discord not ready yet (channel / role changes, `GET /guild`) | `503 unavailable` + `Retry-After: 5` | "Discord isn't ready yet — try again in a few seconds"; retry |
 | Bot still starting (also right after a redeploy, while it restores links: even a valid token can get this for up to a few minutes) | `503 unavailable` + `Retry-After` | "The bot is starting — try again in a few seconds" (the default branch shows the server's message). **Never** set `swbLink.broken` on a 503; keep polling. |
-| Site checked again within 30 s | `429 rate_limited` + `Retry-After` | Same as other 429s: disable **Check now** and count down |
+| Site checked again within 30 s | `429 rate_limited` + `Retry-After` | Disable **Check now** for **that site** and count down (bucket `check:<id>`; never block other calls) |
+| Too many management changes | `429 rate_limited` + `Retry-After` | 60 changes per 10 min: disable the management controls and count down (bucket `manage`) |
 | Not a public website (including `localhost`, LAN IPs, `*.internal`) | `400 invalid_url` | "This page can't be scanned or tracked" |
 | Scan couldn't run, or still running after 50 s | `502 scan_failed` | Message + allow retry |
 | Unexpected error on the bot | `500 internal_error` | Generic message + allow retry |
@@ -563,27 +640,29 @@ The code in §4 handles this:
 
 **Auth:** `Authorization: Bearer swb_…` (or `X-Link-Token: swb_…`). Missing, unknown or revoked, or the bot is no longer in the token's server → `401 unauthorized`.
 
-**CORS:** every response sends `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Headers: Authorization, Content-Type, X-Link-Token`, `Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS`, `Access-Control-Max-Age: 600` and `Access-Control-Expose-Headers: Retry-After`. `OPTIONS` → `204` without auth.
+**Rights:** a token can read and change every watch of **its own** server (it was created by a Manage Server member) and nothing of other servers: their watch ids are `404`, their channels / roles `400 invalid_channel` / `invalid_role`.
 
-**Limits per token:** 120 requests/min overall; `POST /scan` 20 per 10 min; `POST /watches` 30 per hour. Exceeding one returns `429 rate_limited` + `Retry-After` (seconds). At most 3 scans run on the bot at once; beyond that `POST /scan` also gets `429 rate_limited`, with `Retry-After: 5`.
+**CORS:** every response sends `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Headers: Authorization, Content-Type, X-Link-Token`, `Access-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS`, `Access-Control-Max-Age: 600` and `Access-Control-Expose-Headers: Retry-After`. `OPTIONS` → `204` without auth.
 
-**Bodies:** JSON up to 32 KB (`413 too_large`); invalid JSON returns `400 bad_request`; a body that takes over 15 s to arrive returns `408 timeout`. Every response is JSON.
+**Limits per token:** 120 requests/min overall; `POST /scan` 20 per 10 min; `POST /watches` and `POST /watches/:id/subdomains/watch` together 30 per hour; management writes (`PATCH /watches/:id`, `POST …/pause|resume`, `PATCH …/rules`, `PATCH …/subdomains`) 60 per 10 min. Exceeding one returns `429 rate_limited` + `Retry-After` (seconds). `POST /watches/:id/check` also has a 30 s cooldown **per site**. At most 3 scans run on the bot at once; beyond that `POST /scan` also gets `429 rate_limited`, with `Retry-After: 5`.
 
-**Errors:** `{ "error": { "code": "snake_case", "message": "human text" } }`. Codes:
+**Bodies:** JSON objects up to 32 KB (`413 too_large`), for `POST` and `PATCH`; invalid JSON returns `400 bad_request`; a body that takes over 15 s to arrive returns `408 timeout`. Every response is JSON. `PATCH` bodies are strict: unknown fields and wrong types are `400 bad_request`.
+
+**Errors:** `{ "error": { "code": "snake_case", "message": "human text", "field"?: "json.path" } }` (`field` only on some validation errors). Codes:
 
 | Code | Status |
 |---|---|
-| `bad_request`, `invalid_url` (also private / internal hosts), `invalid_interval` | 400 |
+| `bad_request`, `invalid_url` (also private / internal hosts), `invalid_interval`, `invalid_pattern`, `invalid_channel`, `invalid_role` | 400 |
 | `unauthorized` | 401 |
 | `not_found` | 404 |
 | `method_not_allowed` | 405 |
 | `timeout` | 408 (slow request body) or 504 (check over 60 s) |
-| `limit_reached` | 409 |
+| `limit_reached`, `name_taken` | 409 |
 | `too_large` | 413 |
 | `rate_limited` | 429 |
 | `internal_error` | 500 |
 | `scan_failed` | 502 |
-| `unavailable` | 503 (bot starting; `POST /watches` and `/check`) |
+| `unavailable` | 503 (bot starting: every write and `/check`; Discord not ready: channel / role changes and `/guild`; `Retry-After`) |
 
 Treat unknown codes as generic.
 
@@ -591,17 +670,28 @@ Treat unknown codes as generic.
 |---|---|---|---|
 | GET | `/ping` | — | `200 PingResponse` |
 | POST | `/scan` | `{ url, subdomains?: "none"\|"quick"\|"full" }` (default `quick`) | `200 ScanResult` (about 25 s budget, cached 60 s; `502` after 50 s) |
-| GET | `/watches[?url=<u>]` | — | `200 { watches: ApiWatch[] }`; with `?url=`: only watches matching u's normalized URL or host, plus `watched: boolean` |
-| POST | `/watches` | `{ url, name?, intervalSec?, features?: { deploy?, text?, pages?, subdomains?, files?, status?, codeIntel? } }` | `201 { created: true, watch }` (first scan runs in the background, `status: "scanning"`); `200 { created: false, watch }` if already watched; `409 limit_reached`; `503 unavailable` |
-| GET | `/watches/:id` | — | `200 { watch: ApiWatch, events: ApiEvent[] }` (20 newest); `404` if not in this server |
+| GET | `/watches[?url=<u>]` | — | `200 { watches: ApiWatch[], summary: ApiServerSummary }`; with `?url=`: only watches matching u's normalized URL or host, plus `watched: boolean` (the summary still covers every watch) |
+| POST | `/watches` | `{ url, name?, intervalSec?, features?: { deploy?, text?, pages?, subdomains?, files?, status?, codeIntel? }, channelId?, pingRoleId? }` | `201 { created: true, watch }` (first scan runs in the background, `status: "scanning"`); `200 { created: false, watch }` if already watched; `409 limit_reached`; `503 unavailable` |
+| GET | `/watches/:id` | — | `200 { watch: ApiWatch, card: ApiCard, events: ApiEvent[] (20 newest), limits: ApiLimits }`; `404` if not in this server |
+| PATCH | `/watches/:id` | `{ name?, intervalSec?, sweepSec?, channelId?, pingRoleId?, paused?, checks?: { [ToggleKey]: boolean } }` | `200 ApiManageResult`; `409 name_taken` |
 | DELETE | `/watches/:id` | — | `200 { deleted: true }` |
-| POST | `/watches/:id/check` | — | `200 { alerts: number, kinds: string[], error: string \| null }`; `504 timeout` after 60 s; `503 unavailable` |
+| POST | `/watches/:id/check` | `{ full?: boolean }` | `200 { alerts: number, kinds: string[], error: string \| null }`; `504 timeout` after 60 s; `503 unavailable` |
+| POST | `/watches/:id/pause`, `/watches/:id/resume` | — | `200 ApiManageResult` (`changed: []` when already in that state) |
+| GET | `/watches/:id/rules` | — | `200 { rules: ApiRules, limits: ApiLimits }` |
+| PATCH | `/watches/:id/rules` | `{ ignorePatterns?, excludePatterns?, extraUrls? (each string[] or { add?, remove? }), scopePath?: string \| null, maxPages? }` | `200 ApiManageResult & { rules: ApiRules }` |
+| GET | `/watches/:id/pages?list=tracked\|untracked\|files&limit=1..500&offset=n` | — | `200 { counts, list, total, pages: ApiPage[], nextOffset: number \| null }` |
+| GET | `/watches/:id/subdomains?limit=1..1000&offset=n` | — | `200 { enabled, rootDomain, known, live, total, subdomains: ApiSubdomain[], nextOffset }` |
+| PATCH | `/watches/:id/subdomains` | `{ enabled: boolean }` | `200 ApiManageResult` |
+| POST | `/watches/:id/subdomains/watch` | `{ host }` | `201 { created: true, watch }` / `200 { created: false, watch }`; `400 invalid_url`; `409 limit_reached` |
+| GET | `/watches/:id/history?limit=1..100&before=<event id>` | — | `200 { events: ApiEvent[] (newest first), nextBefore: number \| null }` |
+| GET | `/guild` | — | `200 ApiGuildInfo`; `503 unavailable` while Discord isn't ready |
 | GET | `/events?since=<id>&limit=<1..200, default 50>` | — | `200 { events: ApiEvent[] (oldest first, id > since), nextSince: number }` |
 
 ```ts
 interface PingResponse {
   ok: true; bot: 'site-watcher'; version: string; apiVersion: 1;
   guild: { id: string }; channelId: string; label: string; watches: number;
+  limits: ApiLimits;
 }
 
 type TechCategory = 'framework' | 'hosting' | 'cdn' | 'cms' | 'docs' | 'ui' | 'analytics' | 'monitoring'
@@ -645,6 +735,74 @@ interface ApiEvent {
   summary: string;           // plain text (may contain **bold**) — render as text
   createdAt: number;         // epoch ms
 }
+
+type ToggleKey = 'deploy' | 'text' | 'pages' | 'subdomains' | 'files' | 'status' | 'codeIntel' | 'maskNumbers';
+
+interface ApiLimits {
+  minIntervalSec: number; maxIntervalSec: number; sweepMinSec: number; sweepMaxSec: number; maxPagesLimit: number;
+  maxPatterns: number; maxPatternChars: number; maxExtraUrls: number; maxScopeChars: number; maxNameChars: number;
+  maxWatches: number;        // 0 = unlimited
+}
+
+/** The Discord site card as data. Every string is plain text from a website or Discord: render it as text. */
+interface ApiCard {
+  id: number; name: string; url: string; host: string; rootDomain: string;
+  status: string;            // as ApiWatch.status
+  statusLabel: string;       // "Up" | "Down" | "Paused" | "First scan pending" | "Blocked by the site’s bot protection"
+  downSince: number | null; downError: string | null;   // only while down and not paused
+  lastCheckAt: number | null; lastChangeAt: number | null;
+  schedule: { intervalSec: number; sweepSec: number };
+  alerts: {
+    channelId: string; channelName: string | null;   // null: Discord's cache doesn't know it
+    canPost: boolean | null;                          // null: unknown (Discord not ready)
+    missing: string[];                                // "View Channel" | "Send Messages" | "Embed Links" | "channel not found"
+    ping: 'none' | 'role' | 'everyone'; pingRoleId: string | null; pingRoleName: string | null;
+  };
+  build: { id: string | null; bundles: number; generator: string | null } | null;   // null: "unknown"
+  pages: { tracked: number; maxPages: number; known: number; files: number; gone: number; dynamic: number };
+  subdomains: { enabled: boolean; known: number; live: number };
+  rules: { ignorePatterns: number; excludePatterns: number; extraUrls: number; scopePath: string | null };
+  checks: Array<{ key: ToggleKey; label: string; emoji: string; hint: string; on: boolean }>;   // dashboard order
+  runtime: { running: boolean; baselineRunning: boolean; lastTickAt: number | null; lastTickMs: number | null; nextTickAt: number | null } | null;
+  lastError: string | null;
+  warnings: string[];        // plain text: delivery problem, shared CT quota
+  createdAt: number;
+}
+
+interface ApiRules { ignorePatterns: string[]; excludePatterns: string[]; extraUrls: string[]; scopePath: string | null; maxPages: number }
+
+interface ApiManageResult {
+  changed: string[];         // [] = nothing changed, nothing written
+  message: string;           // "Saved — interval 2s → 5s · Text changes off" | "Nothing changed."
+  warnings: string[];
+  watch: ApiWatch; card: ApiCard;
+}
+
+interface ApiServerSummary {
+  total: number; limit: number;   // limit 0 = unlimited
+  counts: { up: number; down: number; blocked: number; paused: number; scanning: number };
+  channels: Array<{ id: string; name: string | null; watches: number }>;   // most watches first
+  text: string;              // "Watching 13 sites · alerts in #scans · 9 up · 1 blocked · 1 paused · 2 scanning"
+}
+
+interface ApiPage {
+  url: string; path: string; title: string | null; kind: 'page' | 'file'; tracked: boolean; gone: boolean; dynamic: boolean;
+  status: number | null; source: string; depth: number; firstSeen: number; lastChecked: number | null; lastChanged: number | null;
+  contentType: string | null; contentLength: number | null;
+}
+
+interface ApiSubdomain {
+  host: string; sources: string[]; alive: boolean; firstSeen: number; lastSeen: number;
+  dns: { a: string[]; aaaa: string[]; cname: string[] } | null;
+  http: { status: number; title: string | null; finalUrl: string | null; server: string | null } | null;
+  watchedAs: { id: number; name: string } | null;   // this server already watches https://<host>/
+}
+
+interface ApiGuildInfo {
+  guild: { id: string; name: string }; tokenChannelId: string;
+  channels: Array<{ id: string; name: string; type: 'text' | 'announcement'; category: string | null; canPost: boolean; missing: string[] }>;
+  roles: Array<{ id: string; name: string; everyone: boolean; managed: boolean; color: number }>;   // highest first, @everyone last
+}
 ```
 
 Example `POST /scan` → `200`, abbreviated:
@@ -678,3 +836,5 @@ Example `POST /watches` with `{ "url": "https://hookedpad.com" }` → `201`:
 ```
 
 **Versioning:** `/api/v1` only gets additive changes: new fields, new endpoints, new enum values. Anything breaking ships as `/api/v2`, and v1 keeps running.
+
+**Local test server:** `PORT=8721 npm run dev:link` in the bot's repo serves this API on `http://127.0.0.1:8721/api/v1` without Discord (token `swb_dev-local-link-token-for-extension-tests000`, seeded watches, a local fixture site). See INTEGRATION.md §10.

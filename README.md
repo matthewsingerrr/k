@@ -121,6 +121,7 @@ The bot can be driven from outside Discord. The **Arkham Dev Tags** Chrome exten
 - **🔎 Scan** any website: tech stack grouped by category, hosting, build id, subdomains, API endpoints and socials.
 - **➕ Add to Discord tracker** in one click: the site is added to your server's watch list and its alerts land in your channel.
 - See whether the current site is already tracked, remove it, trigger a check, and poll the alert feed (desktop notifications).
+- **Manage** a tracked site like the dashboard does: its card, pause / resume, settings (name, interval, alert channel, ping role), checks on/off, rules, pages, subdomains and history, plus the server's site list.
 
 The two projects stay separate: two repos, two deploys. The extension calls this bot's **Link API** (`/api/v1`) on the bot's Railway domain, using a token issued in Discord. No shared secret is built into the extension.
 
@@ -171,6 +172,7 @@ npm test                     # unit + end-to-end tests (fake sites, no internet 
 npm run cli -- https://unpeg.io --once --no-subdomains   # dry run: baseline + one check, alerts printed to the console
 npm run cli -- https://unpeg.io                          # keep watching in the console (Ctrl-C to stop)
 cp .env.example .env && export $(grep -v '^#' .env | xargs) && npm run dev   # run the real bot locally
+PORT=8721 npm run dev:link   # the Link API without Discord, for the extension's tests (see INTEGRATION.md §10)
 ```
 
 ## Limitations
