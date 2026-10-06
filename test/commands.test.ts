@@ -802,7 +802,7 @@ describe('renderers (site card, pages, subdomains, history)', () => {
     expect(text).toContain('🟢 **Up** · last check <t:1700000000:R> · last change never');
     expect(text).toContain('Schedule: every 30s\nall pages ~2m');
     expect(text).toContain(`Alerts: <#${ALERTS}>\nping: <@&${ROLE}>`);
-    expect(text).toContain('Pages: 3 tracked (max 150) · 4 known\n1 files · 1 gone · 1 too dynamic');
+    expect(text).toContain('Pages: 3 tracked (max 150) · 4 known\n1 file · 1 gone · 1 too dynamic');
     expect(text).toContain('Subdomains: 2 known · 1 live');
     expect(text).toContain('`KU79xyz` · 2 bundles · Next.js');
     expect(text).toContain('1 ignore pattern\n0 skipped URL patterns\n1 extra page\nscope: whole site');
@@ -842,7 +842,7 @@ describe('renderers (site card, pages, subdomains, history)', () => {
       page(w.id, 'https://unpeg.io/w.pdf', { kind: 'file', text: null }),
     ]);
     const text = textOf({ type: 'reply', payload: { embeds: [renderPages(deps, w)] } });
-    expect(text).toContain('**2** tracked · **3** known · **1** files · **0** gone · **1** too dynamic to diff');
+    expect(text).toContain('**2** tracked · **3** known · **1** file · **0** gone · **1** too dynamic to diff');
     expect(text).toContain('`/` · Home \\*page\\*');
     expect(text).toContain('`/docs` · _dynamic_');
     expect(text).toContain('Files: `/w.pdf`');

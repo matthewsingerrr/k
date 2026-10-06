@@ -1111,7 +1111,7 @@ export function renderSiteInfo(deps: CommandDeps, w: Watch, i?: Pick<Repliable, 
     { name: 'Build', value: buildParts.length ? buildParts.join(' · ') : 'unknown', inline: true },
     {
       name: 'Pages',
-      value: `${tracked.length} tracked (max ${w.maxPages}) · ${knownPages} known\n${files} files · ${gone} gone · ${dynamic} too dynamic`,
+      value: `${tracked.length} tracked (max ${w.maxPages}) · ${knownPages} known\n${files} ${files === 1 ? 'file' : 'files'} · ${gone} gone · ${dynamic} too dynamic`,
       inline: true,
     },
     { name: 'Subdomains', value: w.features.subdomains ? `${subs.length} known · ${alive} live${ctNote(deps)}` : `off (${subs.length} known)`, inline: true },
@@ -1139,7 +1139,7 @@ export function renderPages(deps: CommandDeps, w: Watch): APIEmbed {
   const files = store.listPages(w.id, { kind: 'file' });
   const gone = tracked.filter((p) => p.gone).length;
   const dynamic = tracked.filter((p) => p.dynamic).length;
-  const head = `**${tracked.length}** tracked · **${known}** known · **${files.length}** files · **${gone}** gone · **${dynamic}** too dynamic to diff`;
+  const head = `**${tracked.length}** tracked · **${known}** known · **${files.length}** ${files.length === 1 ? 'file' : 'files'} · **${gone}** gone · **${dynamic}** too dynamic to diff`;
   const lines = tracked.map((p) => {
     let line = codeSpan(urlPath(p.url), 120);
     const title = (p.title ?? '').replace(/[\r\n]+/g, ' ').trim();

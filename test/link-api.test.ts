@@ -1085,7 +1085,7 @@ describe('Link API management: the card, limits and the server list', () => {
     const embed = renderSiteInfo({ store: h.store, config: testConfig(), log: silentLogger, monitor: h.monitor as unknown as Monitor } as CommandDeps, h.store.getWatch(w.id)!);
     const field = (name: string) => embed.fields!.find((f) => f.name === name)!.value;
     const p = card.pages;
-    expect(field('Pages')).toBe(`${p.tracked} tracked (max ${p.maxPages}) · ${p.known} known\n${p.files} files · ${p.gone} gone · ${p.dynamic} too dynamic`);
+    expect(field('Pages')).toBe(`${p.tracked} tracked (max ${p.maxPages}) · ${p.known} known\n${p.files} ${p.files === 1 ? 'file' : 'files'} · ${p.gone} gone · ${p.dynamic} too dynamic`);
     expect(field('Subdomains')).toBe(`off (${card.subdomains.known} known)`);
     expect(field('Build')).toBe(`${card.build.bundles} bundles`);
     expect(field('Rules')).toBe('0 ignore patterns\n0 skipped URL patterns\n0 extra pages\nscope: whole site');
