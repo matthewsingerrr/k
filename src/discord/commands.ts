@@ -53,7 +53,7 @@ import type { Store } from '../db/store.js';
 import type { BaselineSummary, Monitor } from '../monitor/scheduler.js';
 import { isWalledOff } from '../monitor/status.js';
 import type { AlertKind, Logger, Watch, WatchFeatures, WatchState } from '../types.js';
-import { compileUrlPattern, isPathGlob, isUnderDomain, normalizeUrl, parseWatchInput, urlPath } from '../extract/url.js';
+import { compileUrlPattern, isPathGlob, isUnderDomain, normalizeUrl, parseWatchInput, urlPath, type ParsedWatchInput } from '../extract/url.js';
 import { ALERT_COLORS, WATCH_SUB_PREFIX, clampEmbed, codeSpan, escapeMarkdown, formatDuration, truncate } from './format.js';
 import { LINK_COMMAND_NAME, handleLinkAutocomplete, handleLinkCommand, linkCommandDefinition } from './link.js';
 import type { PanelHost } from './panel.js';
@@ -131,6 +131,25 @@ export class UserError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'UserError';
+  }
+}
+
+/** A UserError about one entry of a list the user entered (`index` into that list; null = the list as a whole). */
+export class ListEntryError extends UserError {
+  constructor(
+    message: string,
+    readonly index: number | null,
+  ) {
+    super(message);
+    this.name = 'ListEntryError';
+  }
+}
+
+/** The server already watches its maximum number of sites (MAX_WATCHES_PER_GUILD). */
+export class WatchLimitError extends UserError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'WatchLimitError';
   }
 }
 
@@ -365,7 +384,7 @@ export function nameTaken(deps: Pick<CommandDeps, 'store'>, guildId: string, nam
   return deps.store.listWatches(guildId).some((w) => w.id !== exceptId && w.name.trim().toLowerCase() === lower);
 }
 
-function uniqueName(deps: CommandDeps, guildId: string, base: string): string {
+function uniqueName(deps: Pick<CommandDeps, 'store'>, guildId: string, base: string): string {
   const clean = truncate(base, MAX_NAME_CHARS - 4);
   if (!nameTaken(deps, guildId, clean)) return clean;
   for (let n = 2; n < 1000; n++) {
@@ -519,6 +538,47 @@ export function validatePattern(pattern: string, kind: 'ignore' | 'exclude'): st
 }
 
 /**
+ * Validate an edited pattern list (the 🚫 Rules modal, the Link API): at most MAX_PATTERNS entries, and every entry that is
+ * not in `current` passes validatePattern (existing entries were validated when they were added). Throws ListEntryError
+ * with the failing entry's index in `next` (null when the list is too long).
+ */
+export function validateNewPatterns(next: string[], current: string[], kind: 'ignore' | 'exclude'): void {
+  const what = kind === 'ignore' ? 'ignore' : 'skip-URL';
+  if (next.length > MAX_PATTERNS) throw new ListEntryError(`At most ${MAX_PATTERNS} ${what} patterns per site (you entered ${next.length}).`, null);
+  for (let n = 0; n < next.length; n++) {
+    const p = next[n];
+    if (current.includes(p)) continue; // validated when it was added
+    try {
+      validatePattern(p, kind);
+    } catch (err) {
+      if (err instanceof UserError) throw new ListEntryError(`${kind === 'ignore' ? 'Ignore' : 'Skip-URL'} pattern ${codeSpan(p, 100)}: ${err.message}`, n);
+      throw err;
+    }
+  }
+}
+
+/**
+ * Resolve an edited extra-pages list (one entry per line) against the watch (resolvePageUrl), de-duplicated, at most
+ * MAX_EXTRA_URLS. `check(url, index)` may throw to refuse a resolved URL. Throws ListEntryError with the failing entry's
+ * index (null when the list is too long).
+ */
+export function resolveExtraPages(
+  lines: string[],
+  watch: Pick<Watch, 'url' | 'host' | 'rootDomain'>,
+  check?: (url: string, index: number) => void,
+): string[] {
+  const extra: string[] = [];
+  for (let n = 0; n < lines.length; n++) {
+    const url = resolvePageUrl(lines[n], watch);
+    if (!url) throw new ListEntryError(`${codeSpan(lines[n], 100)} is not a valid http(s) URL or path.`, n);
+    check?.(url, n);
+    if (!extra.includes(url)) extra.push(url);
+  }
+  if (extra.length > MAX_EXTRA_URLS) throw new ListEntryError(`At most ${MAX_EXTRA_URLS} extra pages per site (you entered ${extra.length}).`, null);
+  return extra;
+}
+
+/**
  * Resolve an extra-page URL: absolute http(s) URLs as-is, "unpeg.io/x"-style inputs whose host is (under) the watched domain or
  * a real public domain followed by a path, anything else relative to the watch URL. Returns a normalized URL or null.
  */
@@ -550,7 +610,7 @@ export function resolvePageUrl(raw: string, watch: Pick<Watch, 'url' | 'host' | 
 }
 
 /** Missing bot permissions in a channel (best effort: empty when it can't be determined). */
-function missingChannelPerms(i: Pick<Repliable, 'guild'>, channelId: string): string[] {
+export function missingChannelPerms(i: Pick<Repliable, 'guild'>, channelId: string): string[] {
   try {
     const guild = i.guild;
     const me = guild?.members?.me;
@@ -628,7 +688,7 @@ function baselineLines(watch: Watch, summary: BaselineSummary | null, error: str
 }
 
 /** Cert Spotter without an API key shares its hourly quota with every other client on the host's IP. */
-function ctNote(deps: CommandDeps): string {
+export function ctNote(deps: Pick<CommandDeps, 'store' | 'config'>): string {
   if (deps.config.certspotterApiKey) return '';
   const n = deps.store.listWatches().filter((w) => w.features.subdomains && !w.paused).length;
   return n > 2 ? `\n⚠️ ${n} sites share one Certificate Transparency quota (no CERTSPOTTER_API_KEY): new names can take a while.` : '';
@@ -685,12 +745,62 @@ export function removeWatch(deps: CommandDeps, w: Watch, by: string): void {
 // Add flow (shared by /watch add and the dashboard's Add site modal)
 // ---------------------------------------------------------------------------
 
-/** Throws when the server already holds the maximum number of watches. */
-function checkWatchLimit(deps: CommandDeps, guildId: string): void {
+/** Throws WatchLimitError when the server already holds the maximum number of watches. */
+function checkWatchLimit(deps: Pick<CommandDeps, 'store' | 'config'>, guildId: string): void {
   const max = deps.config.maxWatchesPerGuild;
   if (typeof max === 'number' && max > 0 && deps.store.listWatches(guildId).length >= max) {
-    throw new UserError(`This server already watches ${max} sites (the limit). Remove one first.`);
+    throw new WatchLimitError(`This server already watches ${max} sites (the limit). Remove one first.`);
   }
+}
+
+const SUBDOMAIN_HOST_RE = /^[a-z0-9_.-]{1,253}$/;
+
+/**
+ * "Watch this subdomain" (the button on subdomain alerts, the Link API): the https://<host>/ target when `rawHost` is a host
+ * name under the parent's root domain (lowercased, trailing dots dropped), else null.
+ */
+export function subdomainTarget(parent: Pick<Watch, 'rootDomain'>, rawHost: string): ParsedWatchInput | null {
+  const host = String(rawHost).toLowerCase().replace(/\.+$/, '');
+  if (!SUBDOMAIN_HOST_RE.test(host)) return null;
+  const parsed = parseWatchInput(`https://${host}/`);
+  return parsed && isUnderDomain(parsed.host, parent.rootDomain) ? parsed : null;
+}
+
+/**
+ * Store a watch for a subdomain the parent found — synchronously, so two clicks can't both pass the duplicate check. It
+ * inherits the parent's channel, interval, sweep, max pages, ping role, checks (subdomains off), ignore patterns and
+ * "Ignore numbers", named "<parent> (<first label>)". The server's existing watch of https://<host>/ is returned as
+ * `created: false`. Throws WatchLimitError at the server's site limit. The caller runs the first scan.
+ */
+export function addSubdomainWatch(
+  deps: Pick<CommandDeps, 'store' | 'config'>,
+  parent: Watch,
+  target: ParsedWatchInput,
+  userId: string,
+): { created: boolean; watch: Watch } {
+  const { store } = deps;
+  const guildId = parent.guildId;
+  const existing = store.findWatchByUrl(guildId, `${target.host}/`);
+  if (existing) return { created: false, watch: existing };
+  checkWatchLimit(deps, guildId);
+  const label = target.host.split('.')[0] || target.host;
+  const watch = store.createWatch({
+    guildId,
+    channelId: parent.channelId,
+    name: uniqueName(deps, guildId, `${truncate(parent.name, 60)} (${truncate(label, 30)})`),
+    url: target.url,
+    host: target.host,
+    rootDomain: target.rootDomain,
+    createdBy: userId,
+    intervalSec: parent.intervalSec,
+    sweepSec: parent.sweepSec,
+    maxPages: parent.maxPages,
+    pingRoleId: parent.pingRoleId,
+    features: { ...parent.features, subdomains: false },
+    ignorePatterns: parent.ignorePatterns,
+    maskNumbers: parent.maskNumbers,
+  });
+  return { created: true, watch };
 }
 
 /**
@@ -1315,31 +1425,13 @@ export async function handleButton(interaction: ButtonInteraction, deps: Command
     if (!hasManageGuild(interaction)) throw new UserError('You need the **Manage Server** permission to add watches.');
     const parent = store.getWatch(Number(m[1]));
     if (!parent || parent.guildId !== guildId) throw new UserError('The watch that found this subdomain no longer exists.');
-    const host = m[2].toLowerCase().replace(/\.+$/, '');
-    const parsed = parseWatchInput(`https://${host}/`);
-    if (!parsed || !isUnderDomain(parsed.host, parent.rootDomain)) throw new UserError('This button is no longer valid.');
-    const existing = store.findWatchByUrl(guildId, `${parsed.host}/`);
-    if (existing) {
-      throw new UserError(`Already watching **${escapeMarkdown(parsed.host)}** as **#${existing.id} ${nameOf(existing)}**.`);
+    const parsed = subdomainTarget(parent, m[2]);
+    if (!parsed) throw new UserError('This button is no longer valid.');
+    const added = addSubdomainWatch(deps, parent, parsed, interaction.user.id);
+    if (!added.created) {
+      throw new UserError(`Already watching **${escapeMarkdown(parsed.host)}** as **#${added.watch.id} ${nameOf(added.watch)}**.`);
     }
-    checkWatchLimit(deps, guildId);
-    const label = parsed.host.split('.')[0] || parsed.host;
-    const created = store.createWatch({
-      guildId,
-      channelId: parent.channelId,
-      name: uniqueName(deps, guildId, `${truncate(parent.name, 60)} (${truncate(label, 30)})`),
-      url: parsed.url,
-      host: parsed.host,
-      rootDomain: parsed.rootDomain,
-      createdBy: interaction.user.id,
-      intervalSec: parent.intervalSec,
-      sweepSec: parent.sweepSec,
-      maxPages: parent.maxPages,
-      pingRoleId: parent.pingRoleId,
-      features: { ...parent.features, subdomains: false },
-      ignorePatterns: parent.ignorePatterns,
-      maskNumbers: parent.maskNumbers,
-    });
+    const created = added.watch;
     log.info('watch added from subdomain button', { watchId: created.id, url: created.url, parent: parent.id, by: interaction.user.id });
 
     await defer(interaction, true, log);

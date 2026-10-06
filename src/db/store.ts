@@ -250,6 +250,38 @@ function linkFromRow(r: LinkTokenRow): LinkToken {
   };
 }
 
+/** Page counts of a watch, as on the site card. */
+export interface PageStats {
+  /** Tracked pages (text compared). */
+  tracked: number;
+  /** Known pages (tracked or not). */
+  known: number;
+  files: number;
+  /** Tracked pages considered removed. */
+  gone: number;
+  /** Tracked pages too dynamic to diff. */
+  dynamic: number;
+}
+
+/** A page row without its text and noise bookkeeping (listPageSummaries). */
+export type PageSummary = Pick<
+  PageRecord,
+  | 'url'
+  | 'kind'
+  | 'tracked'
+  | 'title'
+  | 'gone'
+  | 'dynamic'
+  | 'status'
+  | 'source'
+  | 'depth'
+  | 'firstSeen'
+  | 'lastChecked'
+  | 'lastChanged'
+  | 'contentType'
+  | 'contentLength'
+>;
+
 export interface GuildSettings {
   guildId: string;
   panelChannelId: string | null;
@@ -855,6 +887,64 @@ export class Store {
     return Number(this.stmt(`SELECT COUNT(*) FROM pages WHERE ${where}`).pluck().get(...params)) || 0;
   }
 
+  /** The site card's page counts in one aggregate query (never reads page text). `gone` / `dynamic` count tracked pages. */
+  pageStats(watchId: number): PageStats {
+    const row = this.stmt(
+      `SELECT SUM(kind = 'page' AND tracked = 1) AS tracked, SUM(kind = 'page') AS known, SUM(kind = 'file') AS files,
+         SUM(kind = 'page' AND tracked = 1 AND gone = 1) AS gone, SUM(kind = 'page' AND tracked = 1 AND dynamic = 1) AS dynamic
+       FROM pages WHERE watch_id = ?`,
+    ).get(watchId) as Record<keyof PageStats, number | null> | undefined;
+    const n = (v: number | null | undefined) => Number(v) || 0;
+    return { tracked: n(row?.tracked), known: n(row?.known), files: n(row?.files), gone: n(row?.gone), dynamic: n(row?.dynamic) };
+  }
+
+  /** One page of page rows without their text (same order as listPages: depth, first seen, url). */
+  listPageSummaries(watchId: number, filter: { kind?: PageKind; tracked?: boolean; limit: number; offset?: number }): PageSummary[] {
+    const { where, params } = pageFilter(watchId, filter);
+    const limit = Math.max(0, Math.floor(finite(filter.limit, 0)));
+    const offset = Math.max(0, Math.floor(finite(filter.offset, 0)));
+    if (limit === 0) return [];
+    const rows = this.stmt(
+      `SELECT url, kind, tracked, title, gone, dynamic, status, source, depth, first_seen, last_checked, last_changed, content_type,
+         content_length
+       FROM pages WHERE ${where} ORDER BY depth, first_seen, url LIMIT ? OFFSET ?`,
+    ).all(...params, limit, offset) as Array<
+      Pick<
+        PageRow,
+        | 'url'
+        | 'kind'
+        | 'tracked'
+        | 'title'
+        | 'gone'
+        | 'dynamic'
+        | 'status'
+        | 'source'
+        | 'depth'
+        | 'first_seen'
+        | 'last_checked'
+        | 'last_changed'
+        | 'content_type'
+        | 'content_length'
+      >
+    >;
+    return rows.map((r) => ({
+      url: r.url,
+      kind: PAGE_KINDS.includes(r.kind as PageKind) ? (r.kind as PageKind) : 'page',
+      tracked: r.tracked === 1,
+      title: r.title,
+      gone: r.gone === 1,
+      dynamic: r.dynamic === 1,
+      status: r.status,
+      source: PAGE_SOURCES.includes(r.source as PageSource) ? (r.source as PageSource) : 'link',
+      depth: r.depth ?? 0,
+      firstSeen: r.first_seen ?? 0,
+      lastChecked: r.last_checked ?? 0,
+      lastChanged: r.last_changed ?? null,
+      contentType: r.content_type,
+      contentLength: r.content_length,
+    }));
+  }
+
   /** Insert or replace a page row. No-op if the watch no longer exists. */
   upsertPage(rec: PageRecord): void {
     this.stmt(UPSERT_PAGE_SQL).run(pageParams(rec));
@@ -893,6 +983,14 @@ export class Store {
   countSubdomains(watchId: number): number {
     const row = this.stmt(`SELECT COUNT(*) AS n FROM subdomains WHERE watch_id = ?`).get(watchId) as { n: number } | undefined;
     return row?.n ?? 0;
+  }
+
+  /** Known subdomains and how many of them are live, in one query. */
+  subdomainStats(watchId: number): { known: number; live: number } {
+    const row = this.stmt(`SELECT COUNT(*) AS known, SUM(alive = 1) AS live FROM subdomains WHERE watch_id = ?`).get(watchId) as
+      | { known: number | null; live: number | null }
+      | undefined;
+    return { known: Number(row?.known) || 0, live: Number(row?.live) || 0 };
   }
 
   listSubdomains(watchId: number): SubdomainRecord[] {
@@ -1036,10 +1134,15 @@ export class Store {
     }));
   }
 
-  listEvents(watchId: number, limit: number): EventRecord[] {
+  /** Newest first; with `beforeId`, only events with id < beforeId (paging back through the history). */
+  listEvents(watchId: number, limit: number, beforeId?: number | null): EventRecord[] {
     const n = Math.max(0, Math.floor(finite(limit, 0)));
     if (n === 0) return [];
-    const rows = this.stmt(`SELECT * FROM events WHERE watch_id = ? ORDER BY id DESC LIMIT ?`).all(watchId, n) as EventRow[];
+    const rows = (
+      typeof beforeId === 'number' && Number.isFinite(beforeId)
+        ? this.stmt(`SELECT * FROM events WHERE watch_id = ? AND id < ? ORDER BY id DESC LIMIT ?`).all(watchId, Math.floor(beforeId), n)
+        : this.stmt(`SELECT * FROM events WHERE watch_id = ? ORDER BY id DESC LIMIT ?`).all(watchId, n)
+    ) as EventRow[];
     return rows.map((r) => ({
       id: r.id,
       watchId: r.watch_id,

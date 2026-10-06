@@ -7,6 +7,7 @@ import { HttpClient } from './net/http.js';
 import { Monitor } from './monitor/scheduler.js';
 import { startBot } from './discord/bot.js';
 import { PanelManager } from './discord/backup.js';
+import { guildSnapshot } from './discord/guild-info.js';
 import { Events } from 'discord.js';
 import { startHealthServer, type HttpRouteHandler } from './health.js';
 import { createDnsProvider } from './net/dns.js';
@@ -87,6 +88,8 @@ async function main(): Promise<void> {
       // so every guild counts as present until then (unavailable guilds stay in the cache during Discord outages).
       isGuildActive: (guildId) => !bot.isReady() || bot.client.guilds.cache.has(guildId),
       isRestoring: () => panels?.restoring() ?? true,
+      // Channels and roles for management writes and GET /guild: the gateway cache only (null until Discord is ready).
+      guildInfo: (guildId) => (bot.isReady() ? guildSnapshot(bot.client.guilds.cache.get(guildId)) : null),
       announce: async (channelId, content) => {
         try {
           if (!bot.isReady()) {

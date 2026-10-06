@@ -46,7 +46,6 @@ import {
 import type { Watch, WatchPatch } from '../types.js';
 import {
   FEATURE_TOGGLES,
-  MAX_EXTRA_URLS,
   MAX_INTERVAL_SEC,
   MAX_NAME_CHARS,
   MAX_PAGES_LIMIT,
@@ -77,13 +76,14 @@ import {
   renderSubdomains,
   replyError,
   requireManageGuild,
-  resolvePageUrl,
+  resolveExtraPages,
   respond,
   roleMention,
   runCheck,
   safeState,
   siteStatus,
   toggleValue,
+  validateNewPatterns,
   validatePattern,
   type CommandDeps,
   type ToggleKey,
@@ -800,20 +800,6 @@ async function submitSettings(i: ModalSubmitInteraction, deps: CommandDeps, w: W
   await show(i, cardView(deps, updated, i, lines.join('\n')), deps);
 }
 
-function validateNewPatterns(next: string[], current: string[], kind: 'ignore' | 'exclude'): void {
-  const what = kind === 'ignore' ? 'ignore' : 'skip-URL';
-  if (next.length > MAX_PATTERNS) throw new UserError(`At most ${MAX_PATTERNS} ${what} patterns per site (you entered ${next.length}).`);
-  for (const p of next) {
-    if (current.includes(p)) continue; // validated when it was added
-    try {
-      validatePattern(p, kind);
-    } catch (err) {
-      if (err instanceof UserError) throw new UserError(`${kind === 'ignore' ? 'Ignore' : 'Skip-URL'} pattern ${codeSpan(p, 100)}: ${err.message}`);
-      throw err;
-    }
-  }
-}
-
 async function submitRules(i: ModalSubmitInteraction, deps: CommandDeps, w: Watch): Promise<void> {
   const patch: WatchPatch = {};
   const changes: string[] = [];
@@ -840,13 +826,7 @@ async function submitRules(i: ModalSubmitInteraction, deps: CommandDeps, w: Watc
   }
   const extraRaw = readList(i, 'extra', w.extraUrls);
   if (extraRaw) {
-    const extra: string[] = [];
-    for (const line of extraRaw) {
-      const url = resolvePageUrl(line, w);
-      if (!url) throw new UserError(`${codeSpan(line, 100)} is not a valid http(s) URL or path.`);
-      if (!extra.includes(url)) extra.push(url);
-    }
-    if (extra.length > MAX_EXTRA_URLS) throw new UserError(`At most ${MAX_EXTRA_URLS} extra pages per site (you entered ${extra.length}).`);
+    const extra = resolveExtraPages(extraRaw, w);
     if (!sameList(extra, w.extraUrls)) {
       patch.extraUrls = extra;
       changes.push(plural(extra.length, 'extra page'));

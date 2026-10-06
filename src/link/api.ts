@@ -3,44 +3,74 @@
  *
  * ENDPOINT CONTRACT (single source of truth — INTEGRATION.md documents exactly this):
  * Base: <PUBLIC_URL>/api/v1. Every response is JSON (`content-type: application/json; charset=utf-8`).
- * Errors: `{ "error": { "code": "<snake_case>", "message": "<human text>" } }` with a fitting status.
+ * Errors: `{ "error": { "code": "<snake_case>", "message": "<human text>", "field"?: "<JSON path into the body>" } }` with a
+ *   fitting status (`field` only on some validation errors).
  *
  * Auth: `Authorization: Bearer swb_…` (also accepted: `X-Link-Token: swb_…`). Tokens come from Discord `/link create`
  *   and are bound to one guild + one alert channel (store.findLinkToken). Missing/unknown → 401 `unauthorized`
  *   (also when the bot is no longer in the token's guild, or the bot is locked to another guild by DISCORD_GUILD_ID).
  *   Successful auth → store.touchLinkToken (at most once a minute per token).
+ *   A token was created by a member with Manage Server, so it has the dashboard's rights over every watch of ITS server
+ *   (also ones added in Discord or posting elsewhere) and none over other servers: another server's watch id is 404, its
+ *   channels and roles are 400 invalid_channel / invalid_role.
  * CORS (for the extension's background worker / pages): every /api/v1 response carries
  *   Access-Control-Allow-Origin: *, Access-Control-Allow-Headers: Authorization, Content-Type, X-Link-Token,
- *   Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS, Access-Control-Max-Age: 600. OPTIONS → 204, no auth.
- * Limits per token (in-memory token buckets): 120 requests/min overall; POST /scan 20 per 10 min; POST /watches 30/hour.
- *   Exceeded → 429 `rate_limited` + Retry-After (seconds). Request bodies: JSON, ≤ 32 KB (413 `too_large`);
+ *   Access-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS, Access-Control-Max-Age: 600. OPTIONS → 204, no auth.
+ * Limits per token (in-memory token buckets): 120 requests/min overall; POST /scan 20 per 10 min; POST /watches and
+ *   POST /watches/:id/subdomains/watch 30/hour; management writes (PATCH /watches/:id, POST /watches/:id/pause|resume,
+ *   PATCH /watches/:id/rules, PATCH /watches/:id/subdomains) 60 per 10 min.
+ *   Exceeded → 429 `rate_limited` + Retry-After (seconds). Request bodies (POST, PATCH): JSON, ≤ 32 KB (413 `too_large`);
  *   invalid JSON → 400 `bad_request`. Unknown route → 404 `not_found`; wrong method → 405 `method_not_allowed`.
  *
  * GET    /api/v1/ping                → 200 { ok: true, bot: "site-watcher", version, apiVersion: 1,
- *                                            guild: { id }, channelId, label, watches: <count in guild> }
+ *                                            guild: { id }, channelId, label, watches: <count in guild>, limits: ApiLimits }
  * POST   /api/v1/scan                  body { url, subdomains?: "none"|"quick"|"full" }
  *                                     → 200 ScanResult (src/link/types.ts); bad url, or a private / internal host
  *                                       (localhost, 10.x, *.internal, … unless ALLOW_PRIVATE_NETWORK) → 400 `invalid_url`;
  *                                       scan failure → 502 `scan_failed`.
- * GET    /api/v1/watches[?url=<u>]     → 200 { watches: ApiWatch[] } (guild's watches; with ?url= only those whose
- *                                       normalized url or host matches, plus `watched: boolean`).
+ * GET    /api/v1/watches[?url=<u>]     → 200 { watches: ApiWatch[], summary: ApiServerSummary } (guild's watches; with ?url=
+ *                                       only those whose normalized url or host matches, plus `watched: boolean`; the
+ *                                       summary always covers every watch of the guild).
  * POST   /api/v1/watches               body { url, name?, intervalSec?, features?: { deploy?, text?, pages?, subdomains?,
- *                                       files?, status?, codeIntel? } }
- *                                     → 201 { created: true, watch } — the site is added to the token's guild/channel,
- *                                       its silent first scan (monitor.runBaseline, then monitor.onWatchAdded) runs in the
+ *                                       files?, status?, codeIntel? }, channelId?, pingRoleId? }
+ *                                     → 201 { created: true, watch } — the site is added to the token's guild (alerts in
+ *                                       `channelId`, default the token's channel; `pingRoleId` default none), its silent
+ *                                       first scan (monitor.runBaseline, then monitor.onWatchAdded) runs in the
  *                                       background (status "scanning" until done), and Discord gets
  *                                       "➕ **<name>** (<url>) was added from **<label>** — first scan running…"
  *                                       (via deps.announce) and, when the scan finishes, "✅ Now watching **<name>** …".
  *                                     → 200 { created: false, watch } if the guild already watches that URL.
- *                                     → 400 `invalid_url` (also private / internal hosts, as for /scan) / `invalid_interval`;
- *                                       409 `limit_reached` (MAX_WATCHES_PER_GUILD).
+ *                                     → 400 `invalid_url` (also private / internal hosts, as for /scan) / `invalid_interval` /
+ *                                       `invalid_channel` / `invalid_role`; 409 `limit_reached` (MAX_WATCHES_PER_GUILD).
  *                                       Name defaults like /watch add (parseWatchInput().suggestedName, made unique);
  *                                       interval defaults to config.defaultIntervalSec, clamped to [minIntervalSec, 3600].
- * GET    /api/v1/watches/:id           → 200 { watch: ApiWatch, events: ApiEvent[] (newest 20) }; other guild/unknown → 404.
+ * GET    /api/v1/watches/:id           → 200 { watch: ApiWatch, card: ApiCard, events: ApiEvent[] (newest 20), limits };
+ *                                       other guild/unknown → 404.
+ * PATCH  /api/v1/watches/:id           body { name?, intervalSec?, sweepSec?, channelId?, pingRoleId?, paused?,
+ *                                       checks?: { <ToggleKey>: boolean } } (⚙️ Settings + 🧩 Features + Pause)
+ *                                     → 200 ApiManageResult; 409 `name_taken`.
  * DELETE /api/v1/watches/:id           → 200 { deleted: true } (store.deleteWatch + monitor.onWatchRemoved; Discord gets
  *                                       "➖ **<name>** was removed from **<label>**").
- * POST   /api/v1/watches/:id/check     → 200 { alerts: <n>, kinds: string[], error: string|null } (monitor.checkNow,
- *                                       max 60 s → 504 `timeout`).
+ * POST   /api/v1/watches/:id/check     body { full?: boolean } → 200 { alerts: <n>, kinds: string[], error: string|null }
+ *                                       (monitor.checkNow, max 60 s → 504 `timeout`).
+ * POST   /api/v1/watches/:id/pause     → 200 ApiManageResult (desired state: a second call changes nothing).
+ * POST   /api/v1/watches/:id/resume    → 200 ApiManageResult.
+ * GET    /api/v1/watches/:id/rules     → 200 { rules: ApiRules, limits }
+ * PATCH  /api/v1/watches/:id/rules     body { ignorePatterns?, excludePatterns?, extraUrls? (each a replacement array or
+ *                                       { add?, remove? }), scopePath?, maxPages? } (🚫 Rules)
+ *                                     → 200 ApiManageResult & { rules }; 400 `invalid_pattern` / `invalid_url`.
+ * GET    /api/v1/watches/:id/pages?list=tracked|untracked|files&limit=<1..500, 100>&offset=<n>
+ *                                     → 200 { counts, list, total, pages: ApiPage[], nextOffset }
+ * GET    /api/v1/watches/:id/subdomains?limit=<1..1000, 200>&offset=<n>
+ *                                     → 200 { enabled, rootDomain, known, live, total, subdomains: ApiSubdomain[], nextOffset }
+ * PATCH  /api/v1/watches/:id/subdomains body { enabled: boolean } → 200 ApiManageResult.
+ * POST   /api/v1/watches/:id/subdomains/watch body { host } → 201 { created: true, watch } (inherits the parent's settings,
+ *                                       subdomains off; first scan + Discord notices as for POST /watches) / 200
+ *                                       { created: false, watch } when already watched; 400 `invalid_url`; 409 `limit_reached`.
+ * GET    /api/v1/watches/:id/history?limit=<1..100, 25>&before=<event id>
+ *                                     → 200 { events: ApiEvent[] (newest first), nextBefore }
+ * GET    /api/v1/guild                 → 200 ApiGuildInfo (alert channels and roles of the token's server, from the gateway
+ *                                       cache); 503 `unavailable` while Discord isn't ready.
  * GET    /api/v1/events?since=<id>&limit=<1..200, default 50>
  *                                     → 200 { events: ApiEvent[] (oldest first, id > since), nextSince: <last id or since> }
  *                                       — clients poll this to mirror alerts.
@@ -48,7 +78,8 @@
  * Implementation notes (beyond the contract):
  * - Route → method → auth → rate limit → body. 405 answers carry `Allow`; 429 answers carry `Retry-After`, which is also
  *   exposed to browser callers (Access-Control-Expose-Headers).
- * - 503 `unavailable` while the monitor has not started yet (adding / checking need it).
+ * - 503 `unavailable` + Retry-After: 5 while the monitor has not started yet (every route that writes or checks needs it),
+ *   and when a request needs Discord's guild cache (channel / role checks, /guild) before it is ready.
  * - 408 `timeout` when a request body does not arrive within BODY_TIMEOUT_MS.
  * - At most MAX_CONCURRENT_SCANS scans run at once across all tokens (they share the bot's outbound HTTP budget with the
  *   monitor); beyond that → 429 `rate_limited` with a short Retry-After.
@@ -57,33 +88,95 @@
  *   sent: a scan that crashes answers 502 with a generic message, a check that crashes answers 200 with a generic `error`.
  * - The add path reuses the /watch add helpers (prepareAdd: synchronous duplicate check + insert, so a double-click can
  *   never create two watches).
+ * - Management writes reuse the dashboard's rules (cleanName / nameTaken, validatePattern via validateNewPatterns,
+ *   resolveExtraPages, parseScope, the FEATURE_TOGGLES switches, addSubdomainWatch). A request is validated completely
+ *   before anything is written (no await in between), then the watch is written once (store.updateWatch, preceded by
+ *   store.resetPageNoise when ignore patterns change) and monitor.onWatchUpdated re-baselines what changed silently.
+ *   A request that changes nothing writes nothing. Management routes never start a check.
  */
 import type http from 'node:http';
 import type { Config } from '../config.js';
-import type { LinkToken, Store } from '../db/store.js';
+import type { LinkToken, PageSummary, Store } from '../db/store.js';
 import type { Monitor, TickSummary, BaselineSummary } from '../monitor/scheduler.js';
-import { DEFAULT_FEATURES, type EventRecord, type Logger, type Watch, type WatchFeatures, type WatchState } from '../types.js';
-import { parseWatchInput } from '../extract/url.js';
+import {
+  DEFAULT_FEATURES,
+  type EventRecord,
+  type Logger,
+  type SubdomainRecord,
+  type Watch,
+  type WatchFeatures,
+  type WatchPatch,
+  type WatchState,
+} from '../types.js';
+import { compileUrlPattern, parseWatchInput, urlPath } from '../extract/url.js';
 import { isWalledOff } from '../monitor/status.js';
 import {
+  FEATURE_TOGGLES,
+  ListEntryError,
+  MAX_EXTRA_URLS,
   MAX_INTERVAL_SEC,
+  MAX_NAME_CHARS,
+  MAX_PAGES_LIMIT,
+  MAX_PATTERN_CHARS,
+  MAX_PATTERNS,
+  MAX_SCOPE_CHARS,
+  SWEEP_MAX_SEC,
+  SWEEP_MIN_SEC,
   UserError,
+  WatchLimitError,
+  addSubdomainWatch,
+  channelMention,
   cleanName,
+  ctNote,
   defaultInterval,
   errMessage,
   minInterval,
   nameOf,
   nameTaken,
+  notifyUpdated,
+  parseScope,
   prepareAdd,
+  resolveExtraPages,
+  resolvePageUrl,
   safeState,
+  siteStatus,
   startWatch,
+  subdomainTarget,
+  toggleValue,
+  validateNewPatterns,
   withDeadline,
   type CommandDeps,
+  type ToggleKey as PanelToggleKey,
 } from '../discord/commands.js';
 import { escapeMarkdown, truncate } from '../discord/format.js';
 import { APP_VERSION } from '../version.js';
 import { ScanInputError, isPrivateTarget, privateTargetMessage, scanSite, type ScanDeps } from './scan.js';
-import { LINK_API_PREFIX, type ApiEvent, type ApiWatch, type ScanResult } from './types.js';
+import {
+  LINK_API_PREFIX,
+  type ApiCard,
+  type ApiEvent,
+  type ApiGuildInfo,
+  type ApiLimits,
+  type ApiManageResult,
+  type ApiPage,
+  type ApiRules,
+  type ApiServerSummary,
+  type ApiSubdomain,
+  type ApiWatch,
+  type ScanResult,
+  type ToggleKey,
+} from './types.js';
+
+/** Discord's view of one server for the Link API: from the gateway cache only, never REST. */
+export interface GuildSnapshot {
+  guild: { id: string; name: string };
+  /** Text and announcement channels (what can be picked as an alert channel), in Discord's display order. */
+  channels: ApiGuildInfo['channels'];
+  /** Highest first, @everyone (id = the guild id) last. */
+  roles: ApiGuildInfo['roles'];
+  /** Other cached channels alerts may already go to (threads, chats of voice channels); never offered as a new choice. */
+  otherChannels?: Array<{ id: string; name: string; missing: string[] }>;
+}
 
 export interface LinkApiDeps {
   store: Store;
@@ -105,6 +198,11 @@ export interface LinkApiDeps {
    * Unknown tokens then get 503 `unavailable` + Retry-After instead of 401, so clients don't treat a redeploy as a revoke.
    */
   isRestoring?: () => boolean;
+  /**
+   * The server's channels and roles (synchronous, gateway cache only). null, a throw or an absent dep mean "unknown":
+   * channel / role changes and GET /guild then answer 503, and cards show channelName: null, canPost: null.
+   */
+  guildInfo?: (guildId: string) => GuildSnapshot | null;
   now?: () => number;
 }
 
@@ -135,24 +233,50 @@ const DISCORD_MAX_CHARS = 2000;
 const WATCH_EVENTS = 20;
 const EVENTS_DEFAULT_LIMIT = 50;
 const EVENTS_MAX_LIMIT = 200;
+const PAGES_DEFAULT_LIMIT = 100;
+const PAGES_MAX_LIMIT = 500;
+const SUBDOMAINS_DEFAULT_LIMIT = 200;
+const SUBDOMAINS_MAX_LIMIT = 1000;
+const HISTORY_DEFAULT_LIMIT = 25;
+const HISTORY_MAX_LIMIT = 100;
+/** One extra page entry, as sent. */
+const MAX_EXTRA_URL_CHARS = 2000;
+/** Retry-After for "not ready yet" 503s. */
+const NOT_READY_RETRY_SEC = '5';
 
-type LimitClass = 'all' | 'scan' | 'add';
+type LimitClass = 'all' | 'scan' | 'add' | 'manage';
 const LIMITS: Record<LimitClass, { capacity: number; windowMs: number }> = {
   all: { capacity: 120, windowMs: 60_000 },
   scan: { capacity: 20, windowMs: 10 * 60_000 },
   add: { capacity: 30, windowMs: 3600_000 },
+  manage: { capacity: 60, windowMs: 10 * 60_000 },
 };
 
 const CORS_HEADERS: Readonly<Record<string, string>> = {
   'access-control-allow-origin': '*',
   'access-control-allow-headers': 'Authorization, Content-Type, X-Link-Token',
-  'access-control-allow-methods': 'GET, POST, DELETE, OPTIONS',
+  'access-control-allow-methods': 'GET, POST, PATCH, DELETE, OPTIONS',
   'access-control-max-age': '600',
   'access-control-expose-headers': 'Retry-After',
 };
 
 const SUBDOMAIN_MODES = new Set(['none', 'quick', 'full']);
 const FEATURE_KEYS = Object.keys(DEFAULT_FEATURES) as Array<keyof WatchFeatures>;
+const TOGGLE_KEYS: ReadonlySet<string> = new Set(FEATURE_TOGGLES.map((t) => t.key));
+const SETTINGS_FIELDS = ['name', 'intervalSec', 'sweepSec', 'channelId', 'pingRoleId', 'paused', 'checks'] as const;
+const RULES_FIELDS = ['ignorePatterns', 'excludePatterns', 'extraUrls', 'scopePath', 'maxPages'] as const;
+const PAGE_LISTS = {
+  tracked: { kind: 'page', tracked: true },
+  untracked: { kind: 'page', tracked: false },
+  files: { kind: 'file' },
+} as const;
+const STATUS_ORDER = ['up', 'down', 'blocked', 'paused', 'scanning'] as const;
+type StatusKey = (typeof STATUS_ORDER)[number];
+
+/** The API's ToggleKey (types.ts) must stay the dashboard's: this fails to compile when they drift apart. */
+type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
+const TOGGLE_KEYS_IN_SYNC: Same<ToggleKey, PanelToggleKey> = true;
+void TOGGLE_KEYS_IN_SYNC;
 
 // ---------------------------------------------------------------------------
 // Rate limiting (token buckets per token id + class; idle buckets are garbage-collected)
@@ -225,10 +349,23 @@ class ApiError extends Error {
     readonly code: string,
     message: string,
     readonly headers: Record<string, string> = {},
+    /** JSON path into the request body of the value that failed validation. */
+    readonly field?: string,
   ) {
     super(message);
     this.name = 'ApiError';
   }
+}
+
+/** 400 with a `field`. */
+function bad(code: string, message: string, field?: string): ApiError {
+  return new ApiError(400, code, message, {}, field);
+}
+
+/** A UserError from the shared validators → 400 `code` with its message as plain text; anything else is rethrown. */
+function userError(err: unknown, code: string, field?: string): ApiError {
+  if (err instanceof UserError) return bad(code, plain(err.message), field);
+  throw err;
 }
 
 function sendJson(res: http.ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
@@ -245,8 +382,8 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown, heade
   res.end(json);
 }
 
-function sendError(res: http.ServerResponse, status: number, code: string, message: string, headers: Record<string, string> = {}): void {
-  sendJson(res, status, { error: { code, message } }, headers);
+function sendError(res: http.ServerResponse, status: number, code: string, message: string, headers: Record<string, string> = {}, field?: string): void {
+  sendJson(res, status, { error: { code, message, ...(field ? { field } : {}) } }, headers);
 }
 
 type BodyResult = { ok: true; value: unknown } | { ok: false; error: ApiError | null };
@@ -321,6 +458,13 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
+/** Strict bodies: a key outside `allowed` → 400 bad_request naming it. */
+function strictKeys(body: Record<string, unknown>, allowed: readonly string[], prefix = ''): void {
+  for (const key of Object.keys(body)) {
+    if (!allowed.includes(key)) throw bad('bad_request', `Unknown field ${prefix}${key}.`, `${prefix}${key}`);
+  }
+}
+
 /** "Bearer swb_…" or X-Link-Token. */
 function presentedToken(req: http.IncomingMessage): string | null {
   const auth = req.headers.authorization;
@@ -346,6 +490,18 @@ function intParam(params: URLSearchParams, name: string): number | null {
   return Number(raw.trim());
 }
 
+/** `limit` query value clamped to 1..max (default when absent). */
+function limitParam(params: URLSearchParams, def: number, max: number): number {
+  const raw = intParam(params, 'limit');
+  return raw === null ? def : Math.min(max, Math.max(1, raw));
+}
+
+/** A JSON number of seconds (finite, > 0), rounded and clamped to [min, max]; null when it isn't one. */
+function seconds(v: unknown, min: number, max: number): number | null {
+  if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) return null;
+  return Math.min(max, Math.max(min, Math.round(v)));
+}
+
 function stripScheme(url: string): string {
   return url.replace(/^https?:\/\//i, '');
 }
@@ -359,12 +515,14 @@ function plain(message: string): string {
   return message.replace(/\*\*|`/g, '').replace(/\\([\\*_`[\]<|~#>+.\-])/g, '$1');
 }
 
+const sameList = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((v, n) => v === b[n]);
+
 // ---------------------------------------------------------------------------
 // Mapping
 // ---------------------------------------------------------------------------
 
 /** Same precedence as the dashboard's siteStatus(): paused > first scan pending > down > blocked > up. */
-function apiStatus(w: Watch, state: Pick<WatchState, 'status'> | null): string {
+function apiStatus(w: Watch, state: Pick<WatchState, 'status'> | null): StatusKey {
   if (w.paused) return 'paused';
   if (!w.baselineDone) return 'scanning';
   if (state?.status && !state.status.up) return 'down';
@@ -406,6 +564,104 @@ function toApiEvent(e: EventRecord, w: Pick<Watch, 'name' | 'url'>): ApiEvent {
   return { id: e.id, watchId: e.watchId, watchName: w.name, watchUrl: w.url, kind: e.kind, summary: e.summary, createdAt: e.createdAt };
 }
 
+function toApiPage(p: PageSummary): ApiPage {
+  return {
+    url: p.url,
+    path: urlPath(p.url),
+    title: p.title ?? null,
+    kind: p.kind,
+    tracked: p.tracked,
+    gone: p.gone,
+    dynamic: p.dynamic,
+    status: p.status ?? null,
+    source: p.source,
+    depth: p.depth,
+    firstSeen: p.firstSeen,
+    lastChecked: p.lastChecked > 0 ? p.lastChecked : null,
+    lastChanged: p.lastChanged ?? null,
+    contentType: p.contentType ?? null,
+    contentLength: p.contentLength ?? null,
+  };
+}
+
+function toApiSubdomain(s: SubdomainRecord, watchedAs: { id: number; name: string } | null): ApiSubdomain {
+  return {
+    host: s.host,
+    sources: [...s.sources],
+    alive: s.alive,
+    firstSeen: s.firstSeen,
+    lastSeen: s.lastSeen,
+    dns: s.dns ? { a: [...s.dns.a], aaaa: [...s.dns.aaaa], cname: [...s.dns.cname] } : null,
+    http: s.http ? { status: s.http.status, title: s.http.title, finalUrl: s.http.finalUrl, server: s.http.server } : null,
+    watchedAs,
+  };
+}
+
+function rulesOf(w: Watch): ApiRules {
+  return {
+    ignorePatterns: [...w.ignorePatterns],
+    excludePatterns: [...w.excludePatterns],
+    extraUrls: [...w.extraUrls],
+    scopePath: w.scopePath ?? null,
+    maxPages: w.maxPages,
+  };
+}
+
+/** A channel the bot knows in this server (name + missing permissions); null when the cache doesn't know it. */
+function channelIn(g: GuildSnapshot | null, id: string): { name: string; missing: string[] } | null {
+  if (!g) return null;
+  const c = g.channels.find((x) => x.id === id) ?? g.otherChannels?.find((x) => x.id === id);
+  return c ? { name: c.name, missing: [...c.missing] } : null;
+}
+
+/** "#name" for plain-text messages, the raw id when the name is unknown. */
+function channelLabel(g: GuildSnapshot | null, id: string): string {
+  const c = channelIn(g, id);
+  return c ? `#${c.name}` : id;
+}
+
+/** Can alerts reach `channelId`? Unknown (null) without Discord's cache. */
+function delivery(g: GuildSnapshot | null, channelId: string): { name: string | null; canPost: boolean | null; missing: string[] } {
+  if (!g) return { name: null, canPost: null, missing: [] };
+  const c = channelIn(g, channelId);
+  if (c) return { name: c.name, canPost: c.missing.length === 0, missing: c.missing };
+  // The gateway caches every channel: one missing from a populated cache was deleted (as missingChannelPerms judges it).
+  const populated = g.channels.length + (g.otherChannels?.length ?? 0) > 0;
+  return populated ? { name: null, canPost: false, missing: ['channel not found'] } : { name: null, canPost: null, missing: [] };
+}
+
+/** Plain-text twin of permsWarning(). */
+function deliveryWarning(label: string, missing: string[]): string | null {
+  if (missing.includes('channel not found')) {
+    return `The alert channel ${label} no longer exists — alerts can't be delivered. Pick another channel in Settings.`;
+  }
+  return missing.length ? `I'm missing ${missing.join(', ')} in ${label} — alerts can't be delivered until that's fixed.` : null;
+}
+
+function pingOf(w: Watch, g: GuildSnapshot | null): Pick<ApiCard['alerts'], 'ping' | 'pingRoleId' | 'pingRoleName'> {
+  if (!w.pingRoleId) return { ping: 'none', pingRoleId: null, pingRoleName: null };
+  if (w.pingRoleId === w.guildId) return { ping: 'everyone', pingRoleId: w.pingRoleId, pingRoleName: '@everyone' };
+  return { ping: 'role', pingRoleId: w.pingRoleId, pingRoleName: g?.roles.find((r) => r.id === w.pingRoleId)?.name ?? null };
+}
+
+/** Root-URL watches of a guild by host (what store.findWatchByUrl(guild, "<host>/") would find), https preferred. */
+function rootWatches(watches: Watch[]): Map<string, Watch> {
+  const out = new Map<string, Watch>();
+  for (const w of watches) {
+    let u: URL;
+    try {
+      u = new URL(w.url);
+    } catch {
+      continue;
+    }
+    if (u.pathname.replace(/\/{2,}/g, '/') !== '/' || u.search) continue;
+    const key = u.host.toLowerCase().replace(/\.$/, '');
+    const seen = out.get(key);
+    if (!seen || (!seen.url.toLowerCase().startsWith('https:') && w.url.toLowerCase().startsWith('https:'))) out.set(key, w);
+  }
+  return out;
+}
+
 function shortBuild(id: string | null): string | null {
   if (!id) return null;
   return id.length > 10 ? `${id.slice(0, 8)}…` : id;
@@ -438,12 +694,37 @@ function nowWatchingMessage(w: Watch, summary: BaselineSummary | null, error: st
 // Routing
 // ---------------------------------------------------------------------------
 
-type RouteName = 'ping' | 'scan' | 'watches' | 'watch' | 'check' | 'events';
+type RouteName =
+  | 'ping'
+  | 'scan'
+  | 'watches'
+  | 'watch'
+  | 'check'
+  | 'events'
+  | 'guild'
+  | 'pause'
+  | 'resume'
+  | 'rules'
+  | 'pages'
+  | 'subdomains'
+  | 'watchSubdomain'
+  | 'history';
 interface Route {
   name: RouteName;
   methods: string[];
   id?: string;
 }
+
+const WATCH_SUBROUTES: Record<string, { name: RouteName; methods: string[] }> = {
+  check: { name: 'check', methods: ['POST'] },
+  pause: { name: 'pause', methods: ['POST'] },
+  resume: { name: 'resume', methods: ['POST'] },
+  rules: { name: 'rules', methods: ['GET', 'PATCH'] },
+  pages: { name: 'pages', methods: ['GET'] },
+  subdomains: { name: 'subdomains', methods: ['GET', 'PATCH'] },
+  'subdomains/watch': { name: 'watchSubdomain', methods: ['POST'] },
+  history: { name: 'history', methods: ['GET'] },
+};
 
 function matchRoute(sub: string): Route | null {
   switch (sub) {
@@ -455,12 +736,28 @@ function matchRoute(sub: string): Route | null {
       return { name: 'watches', methods: ['GET', 'POST'] };
     case '/events':
       return { name: 'events', methods: ['GET'] };
+    case '/guild':
+      return { name: 'guild', methods: ['GET'] };
   }
   let m = /^\/watches\/([^/]+)$/.exec(sub);
-  if (m) return { name: 'watch', methods: ['GET', 'DELETE'], id: m[1] };
-  m = /^\/watches\/([^/]+)\/check$/.exec(sub);
-  if (m) return { name: 'check', methods: ['POST'], id: m[1] };
+  if (m) return { name: 'watch', methods: ['GET', 'PATCH', 'DELETE'], id: m[1] };
+  m = /^\/watches\/([^/]+)\/(check|pause|resume|rules|pages|subdomains|subdomains\/watch|history)$/.exec(sub);
+  if (m) return { ...WATCH_SUBROUTES[m[2]], id: m[1] };
   return null;
+}
+
+/** "GET", "GET or POST", "GET, PATCH or DELETE". */
+function methodList(methods: string[]): string {
+  return methods.length > 1 ? `${methods.slice(0, -1).join(', ')} or ${methods[methods.length - 1]}` : methods.join('');
+}
+
+/** The extra rate-limit classes of a request (every request also takes from `all`). */
+function limitClasses(route: Route, method: string): LimitClass[] {
+  if (route.name === 'scan') return ['scan'];
+  if ((route.name === 'watches' && method === 'POST') || route.name === 'watchSubdomain') return ['add'];
+  if (route.name === 'pause' || route.name === 'resume') return ['manage'];
+  if (method === 'PATCH' && (route.name === 'watch' || route.name === 'rules' || route.name === 'subdomains')) return ['manage'];
+  return [];
 }
 
 interface Ctx {
@@ -471,6 +768,21 @@ interface Ctx {
   query: URLSearchParams;
   token: LinkToken;
   body: Record<string, unknown>;
+}
+
+/** A validated change to a watch: what to write and how to describe it. */
+interface Plan {
+  patch: WatchPatch;
+  changed: string[];
+  parts: string[];
+  warnings: string[];
+}
+
+type ListField = 'ignorePatterns' | 'excludePatterns' | 'extraUrls';
+/** One entry of an edited list and where it came from in the request (null = kept from the current list). */
+interface ListEntry {
+  value: string;
+  field: string | null;
 }
 
 /**
@@ -498,14 +810,16 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
 
   const requireMonitor = (): Monitor => {
     const monitor = deps.getMonitor();
-    if (!monitor) throw new ApiError(503, 'unavailable', 'The bot is still starting — try again in a few seconds.');
+    if (!monitor) {
+      throw new ApiError(503, 'unavailable', 'The bot is still starting — try again in a few seconds.', { 'retry-after': NOT_READY_RETRY_SEC });
+    }
     return monitor;
   };
 
   /** SSRF guard for outside callers: no localhost / private IPs / *.internal (Railway's private network) targets. */
-  const refusePrivate = (host: string): void => {
+  const refusePrivate = (host: string, field?: string): void => {
     if (config.allowPrivateNetwork !== true && isPrivateTarget(host)) {
-      throw new ApiError(400, 'invalid_url', privateTargetMessage(host));
+      throw new ApiError(400, 'invalid_url', privateTargetMessage(host), {}, field);
     }
   };
 
@@ -519,6 +833,40 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
     }
   };
 
+  /** Discord's view of the token's server; null when unknown (no dep, not ready, not cached, or it threw). */
+  const guildOf = (guildId: string): GuildSnapshot | null => {
+    if (!deps.guildInfo) return null;
+    try {
+      const g = deps.guildInfo(guildId);
+      return g && g.guild?.id === guildId && Array.isArray(g.channels) && Array.isArray(g.roles) ? g : null;
+    } catch (err) {
+      log.debug('link: guild info unavailable', { guild: guildId, err: errMessage(err) });
+      return null;
+    }
+  };
+
+  const requireGuild = (guildId: string): GuildSnapshot => {
+    const g = guildOf(guildId);
+    if (!g) throw new ApiError(503, 'unavailable', "Discord isn't ready yet — try again in a few seconds.", { 'retry-after': NOT_READY_RETRY_SEC });
+    return g;
+  };
+
+  /** A text or announcement channel of the server (what Settings' channel select offers), else 400 invalid_channel. */
+  const alertChannel = (guildId: string, raw: unknown, field: string): ApiGuildInfo['channels'][number] => {
+    if (typeof raw !== 'string') throw bad('bad_request', `${field} must be a channel id.`, field);
+    const c = requireGuild(guildId).channels.find((x) => x.id === raw);
+    if (!c) throw bad('invalid_channel', 'That is not a text or announcement channel of this Discord server.', field);
+    return c;
+  };
+
+  /** A role of the server (the guild id = @everyone), else 400 invalid_role. Returns its display name. */
+  const pingRole = (guildId: string, raw: string, field: string): string => {
+    if (raw === guildId) return '@everyone';
+    const r = requireGuild(guildId).roles.find((x) => x.id === raw);
+    if (!r) throw bad('invalid_role', 'That is not a role of this Discord server.', field);
+    return `@${r.name}`;
+  };
+
   const ownWatch = (route: Route, token: LinkToken): Watch => {
     const id = parseId(route.id ?? '');
     const w = id === null ? undefined : store.getWatch(id);
@@ -528,6 +876,375 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
 
   const audit = (token: LinkToken, action: string, meta: Record<string, unknown> = {}) =>
     log.info(`link: ${action}`, { label: token.label, guild: token.guildId, action, ...meta });
+
+  const limits = (): ApiLimits => {
+    const max = config.maxWatchesPerGuild;
+    return {
+      minIntervalSec: minInterval(config),
+      maxIntervalSec: MAX_INTERVAL_SEC,
+      sweepMinSec: SWEEP_MIN_SEC,
+      sweepMaxSec: SWEEP_MAX_SEC,
+      maxPagesLimit: MAX_PAGES_LIMIT,
+      maxPatterns: MAX_PATTERNS,
+      maxPatternChars: MAX_PATTERN_CHARS,
+      maxExtraUrls: MAX_EXTRA_URLS,
+      maxScopeChars: MAX_SCOPE_CHARS,
+      maxNameChars: MAX_NAME_CHARS,
+      maxWatches: typeof max === 'number' && max > 0 ? max : 0,
+    };
+  };
+
+  /** The Discord site card (renderSiteInfo) as data; reads counts with aggregate queries, never page text. */
+  const cardOf = (w: Watch, g: GuildSnapshot | null): ApiCard => {
+    const state = safeState(store, w.id);
+    const down = Boolean(state && !w.paused && !state.status.up);
+    let pages = { tracked: 0, known: 0, files: 0, gone: 0, dynamic: 0 };
+    let subs = { known: 0, live: 0 };
+    try {
+      pages = store.pageStats(w.id);
+      subs = store.subdomainStats(w.id);
+    } catch (err) {
+      log.debug('link: card counts failed', { watchId: w.id, err: errMessage(err) });
+    }
+    const deploy = state?.deploy ?? null;
+    const d = delivery(g, w.channelId);
+    const warnings: string[] = [];
+    const dw = deliveryWarning(d.name ? `#${d.name}` : w.channelId, d.missing);
+    if (dw) warnings.push(dw);
+    if (w.features.subdomains) {
+      const ct = ctNote({ store, config }).replace(/^\s*⚠️\s*/, '').trim();
+      if (ct) warnings.push(ct);
+    }
+    let runtime: ApiCard['runtime'] = null;
+    const monitor = deps.getMonitor();
+    if (monitor) {
+      try {
+        const rt = monitor.runtimeInfo(w.id);
+        runtime = {
+          running: Boolean(rt.running),
+          baselineRunning: Boolean(rt.baselineRunning),
+          lastTickAt: rt.lastTickAt ?? null,
+          lastTickMs: rt.lastTickMs ?? null,
+          nextTickAt: rt.nextTickAt ?? null,
+        };
+      } catch (err) {
+        log.debug('link: runtimeInfo failed', { watchId: w.id, err: errMessage(err) });
+      }
+    }
+    return {
+      id: w.id,
+      name: w.name,
+      url: w.url,
+      host: w.host,
+      rootDomain: w.rootDomain,
+      status: apiStatus(w, state),
+      statusLabel: siteStatus(w, state).label,
+      downSince: down ? (state?.status.downSince ?? null) : null,
+      downError: down ? (state?.status.lastError ?? null) : null,
+      lastCheckAt: state && state.lastCheckAt > 0 ? state.lastCheckAt : null,
+      lastChangeAt: state && state.lastChangeAt > 0 ? state.lastChangeAt : null,
+      schedule: { intervalSec: w.intervalSec, sweepSec: w.sweepSec },
+      alerts: { channelId: w.channelId, channelName: d.name, canPost: d.canPost, missing: d.missing, ...pingOf(w, g) },
+      build: deploy ? { id: deploy.buildId ?? null, bundles: deploy.assets.length, generator: deploy.generator ?? null } : null,
+      pages: { tracked: pages.tracked, maxPages: w.maxPages, known: pages.known, files: pages.files, gone: pages.gone, dynamic: pages.dynamic },
+      subdomains: { enabled: Boolean(w.features.subdomains), known: subs.known, live: subs.live },
+      rules: {
+        ignorePatterns: w.ignorePatterns.length,
+        excludePatterns: w.excludePatterns.length,
+        extraUrls: w.extraUrls.length,
+        scopePath: w.scopePath ?? null,
+      },
+      checks: FEATURE_TOGGLES.map((t) => ({ key: t.key, label: t.label, emoji: t.emoji, hint: t.hint, on: toggleValue(w, t.key) })),
+      runtime,
+      lastError: state?.lastError ?? null,
+      warnings,
+      createdAt: w.createdAt,
+    };
+  };
+
+  /** The dashboard's head line and counts, over every watch of the guild. */
+  const summaryOf = (all: Watch[], g: GuildSnapshot | null): ApiServerSummary => {
+    const counts: ApiServerSummary['counts'] = { up: 0, down: 0, blocked: 0, paused: 0, scanning: 0 };
+    for (const w of all) counts[apiStatus(w, safeState(store, w.id))]++;
+    const perChannel = new Map<string, number>();
+    for (const w of all) perChannel.set(w.channelId, (perChannel.get(w.channelId) ?? 0) + 1);
+    const channels = [...perChannel]
+      .map(([id, watches]) => ({ id, name: channelIn(g, id)?.name ?? null, watches }))
+      .sort((a, b) => b.watches - a.watches);
+    let text = 'No sites yet.';
+    if (all.length) {
+      const where = channels.length === 1 ? `alerts in ${channelLabel(g, channels[0].id)}` : `alerts in ${channels.length} channels`;
+      const tally = STATUS_ORDER.filter((k) => counts[k]).map((k) => `${counts[k]} ${k}`);
+      text = [`Watching ${plural(all.length, 'site')}`, where, ...tally].join(' · ');
+    }
+    return { total: all.length, limit: limits().maxWatches, counts, channels, text };
+  };
+
+  const manageResult = (w: Watch, changed: string[], message: string, warnings: string[]): ApiManageResult => ({
+    changed,
+    message,
+    warnings,
+    watch: toApiWatch(store, w),
+    card: cardOf(w, guildOf(w.guildId)),
+  });
+
+  /** The one write of a management request: store.updateWatch, then the monitor re-baselines what changed silently. */
+  const commit = (w: Watch, patch: WatchPatch, monitor: Monitor): Watch => {
+    const updated = store.updateWatch(w.id, patch);
+    notifyUpdated({ store, config, log, monitor }, updated);
+    return updated;
+  };
+
+  /** Discord notices for a pause / resume and for moved alerts (other changes are quiet, like the dashboard's). */
+  const announceChanges = (before: Watch, after: Watch, token: LinkToken): void => {
+    const by = escapeMarkdown(token.label);
+    void (async () => {
+      if (after.channelId !== before.channelId) {
+        await announce(
+          after.channelId,
+          `📢 Alerts for **${nameOf(after)}** (<${after.url}>) now post here — moved from ${channelMention(before.channelId)} by **${by}**.`,
+        );
+      }
+      if (after.paused !== before.paused) {
+        await announce(after.channelId, after.paused ? `⏸️ **${nameOf(after)}** was paused from **${by}**.` : `▶️ **${nameOf(after)}** was resumed from **${by}**.`);
+      }
+    })();
+  };
+
+  /** Validates a ⚙️ Settings / 🧩 Features / pause body against `w`; writes nothing. */
+  const planSettings = (w: Watch, body: Record<string, unknown>): Plan => {
+    strictKeys(body, SETTINGS_FIELDS);
+    const plan: Plan = { patch: {}, changed: [], parts: [], warnings: [] };
+    const { patch, changed, parts, warnings } = plan;
+
+    if (body.name !== undefined) {
+      if (typeof body.name !== 'string') throw bad('bad_request', 'name must be a string.', 'name');
+      let name: string;
+      try {
+        name = cleanName(body.name) as string;
+      } catch (err) {
+        throw userError(err, 'bad_request', 'name');
+      }
+      if (name !== w.name) {
+        if (nameTaken({ store }, w.guildId, name, w.id)) {
+          throw new ApiError(409, 'name_taken', `A site named ${name} already exists in this server. Pick another name.`, {}, 'name');
+        }
+        patch.name = name;
+        changed.push('name');
+        parts.push(`name → ${name}`);
+      }
+    }
+    if (body.intervalSec !== undefined) {
+      const min = minInterval(config);
+      const v = seconds(body.intervalSec, min, MAX_INTERVAL_SEC);
+      if (v === null) throw bad('invalid_interval', `intervalSec must be a number of seconds (${min}–${MAX_INTERVAL_SEC}).`, 'intervalSec');
+      if (v !== w.intervalSec) {
+        patch.intervalSec = v;
+        changed.push('intervalSec');
+        parts.push(`interval ${w.intervalSec}s → ${v}s`);
+      }
+    }
+    if (body.sweepSec !== undefined) {
+      const v = seconds(body.sweepSec, SWEEP_MIN_SEC, SWEEP_MAX_SEC);
+      if (v === null) throw bad('invalid_interval', `sweepSec must be a number of seconds (${SWEEP_MIN_SEC}–${SWEEP_MAX_SEC}).`, 'sweepSec');
+      if (v !== w.sweepSec) {
+        patch.sweepSec = v;
+        changed.push('sweepSec');
+        parts.push(`full sweep ${w.sweepSec}s → ${v}s`);
+      }
+    }
+    if (body.channelId !== undefined && body.channelId !== w.channelId) {
+      const c = alertChannel(w.guildId, body.channelId, 'channelId');
+      patch.channelId = c.id;
+      changed.push('channelId');
+      parts.push(`channel → #${c.name}`);
+      const dw = deliveryWarning(`#${c.name}`, c.missing);
+      if (dw) warnings.push(dw);
+    }
+    if (body.pingRoleId !== undefined) {
+      const raw = body.pingRoleId;
+      if (raw !== null && typeof raw !== 'string') throw bad('bad_request', 'pingRoleId must be a role id, or null for no ping.', 'pingRoleId');
+      if (raw !== w.pingRoleId) {
+        const label = raw === null ? 'none' : pingRole(w.guildId, raw, 'pingRoleId');
+        patch.pingRoleId = raw;
+        changed.push('pingRoleId');
+        parts.push(`ping → ${label}`);
+      }
+    }
+    if (body.paused !== undefined) {
+      if (typeof body.paused !== 'boolean') throw bad('bad_request', 'paused must be true or false.', 'paused');
+      if (body.paused !== w.paused) {
+        patch.paused = body.paused;
+        changed.push('paused');
+        parts.push(body.paused ? 'paused' : 'resumed');
+      }
+    }
+    if (body.checks !== undefined) {
+      const checks = body.checks;
+      if (!isPlainObject(checks)) throw bad('bad_request', 'checks must be an object of true/false switches.', 'checks');
+      for (const [key, v] of Object.entries(checks)) {
+        if (!TOGGLE_KEYS.has(key)) throw bad('bad_request', `Unknown check ${key}.`, `checks.${key}`);
+        if (typeof v !== 'boolean') throw bad('bad_request', `checks.${key} must be true or false.`, `checks.${key}`);
+      }
+      for (const t of FEATURE_TOGGLES) {
+        const on = checks[t.key];
+        if (typeof on !== 'boolean' || on === toggleValue(w, t.key)) continue;
+        // "Ignore numbers" is watch.maskNumbers; the rest are features (merged by store.updateWatch).
+        if (t.key === 'maskNumbers') patch.maskNumbers = on;
+        else patch.features = { ...patch.features, [t.key as keyof WatchFeatures]: on };
+        changed.push(`checks.${t.key}`);
+        parts.push(`${t.label} ${on ? 'on' : 'off'}`);
+        if (t.key === 'subdomains' && on) {
+          const owner = store.listWatches(w.guildId).find((o) => o.id !== w.id && o.rootDomain === w.rootDomain && o.features.subdomains);
+          if (owner) {
+            warnings.push(`Subdomains of ${w.rootDomain} are already tracked by #${owner.id} ${owner.name} — new subdomains will be announced twice.`);
+          }
+        }
+      }
+    }
+    return plan;
+  };
+
+  /** Writes a settings plan (or nothing) and describes the outcome. */
+  const applySettings = (w: Watch, plan: Plan, token: LinkToken, monitor: Monitor, action: string): ApiManageResult => {
+    if (!plan.changed.length) return manageResult(w, [], 'Nothing changed.', []);
+    const updated = commit(w, plan.patch, monitor);
+    audit(token, action, { watchId: w.id, changes: plan.changed });
+    announceChanges(w, updated, token);
+    return manageResult(updated, plan.changed, `Saved — ${plan.parts.join(' · ')}`, plan.warnings);
+  };
+
+  /**
+   * An edited list from a PATCH body: a replacement array (trimmed, empties dropped, duplicates removed keeping the first)
+   * or { add?, remove? } applied to `current` (remove first, by `removeKeys` of each trimmed entry; then add, skipping
+   * duplicates).
+   */
+  const listFrom = (key: ListField, raw: unknown, current: string[], removeKeys: (entry: string) => Array<string | null>): ListEntry[] => {
+    const strings = (v: unknown, path: string): string[] => {
+      if (!Array.isArray(v)) throw bad('bad_request', `${path} must be a list of strings.`, path);
+      v.forEach((s, n) => {
+        if (typeof s !== 'string') throw bad('bad_request', `${path}[${n}] must be a string.`, `${path}[${n}]`);
+      });
+      return v as string[];
+    };
+    const append = (out: ListEntry[], list: string[], path: string) =>
+      list.forEach((s, n) => {
+        const value = s.trim();
+        if (value && !out.some((e) => e.value === value)) out.push({ value, field: `${path}[${n}]` });
+      });
+    if (Array.isArray(raw)) {
+      const out: ListEntry[] = [];
+      append(out, strings(raw, key), key);
+      return out;
+    }
+    if (!isPlainObject(raw)) throw bad('bad_request', `${key} must be a list of strings, or { add, remove }.`, key);
+    strictKeys(raw, ['add', 'remove'], `${key}.`);
+    const remove = raw.remove === undefined ? [] : strings(raw.remove, `${key}.remove`);
+    const add = raw.add === undefined ? [] : strings(raw.add, `${key}.add`);
+    const drop = new Set<string>();
+    for (const r of remove) for (const k of removeKeys(r.trim())) if (k) drop.add(k);
+    const out: ListEntry[] = current.filter((v) => !drop.has(v)).map((value) => ({ value, field: null }));
+    append(out, add, `${key}.add`);
+    return out;
+  };
+
+  /** Validates a 🚫 Rules body against `w` exactly like the Rules modal; writes nothing. */
+  const planRules = (w: Watch, body: Record<string, unknown>): Plan => {
+    strictKeys(body, RULES_FIELDS);
+    const plan: Plan = { patch: {}, changed: [], parts: [], warnings: [] };
+    const { patch, changed, parts, warnings } = plan;
+
+    for (const [key, kind] of [
+      ['ignorePatterns', 'ignore'],
+      ['excludePatterns', 'exclude'],
+    ] as const) {
+      if (body[key] === undefined) continue;
+      const current = w[key];
+      const entries = listFrom(key, body[key], current, (r) => [r]);
+      const values = entries.map((e) => e.value);
+      try {
+        validateNewPatterns(values, current, kind);
+      } catch (err) {
+        if (err instanceof ListEntryError) throw bad('invalid_pattern', plain(err.message), err.index === null ? key : (entries[err.index]?.field ?? key));
+        throw err;
+      }
+      if (sameList(values, current)) continue;
+      patch[key] = values;
+      changed.push(key);
+      parts.push(kind === 'ignore' ? plural(values.length, 'ignore pattern') : plural(values.length, 'skipped URL pattern'));
+      if (kind === 'exclude') {
+        for (const p of values) {
+          if (current.includes(p)) continue;
+          try {
+            if (compileUrlPattern(p)?.test(w.url)) warnings.push(`${p} also matches the start URL.`);
+          } catch {
+            // validated above
+          }
+        }
+      }
+    }
+    if (body.extraUrls !== undefined) {
+      const current = w.extraUrls;
+      const entries = listFrom('extraUrls', body.extraUrls, current, (r) => [r, resolvePageUrl(r, w)]);
+      for (const e of entries) {
+        if (e.field && e.value.length > MAX_EXTRA_URL_CHARS) {
+          throw bad('invalid_url', `An extra page can be at most ${MAX_EXTRA_URL_CHARS} characters long.`, e.field);
+        }
+      }
+      let extra: string[];
+      try {
+        // New entries only: a private target added in Discord before stays (the bot's HTTP client still refuses it).
+        extra = resolveExtraPages(
+          entries.map((e) => e.value),
+          w,
+          (url, n) => {
+            if (!current.includes(url)) refusePrivate(new URL(url).hostname, entries[n].field ?? 'extraUrls');
+          },
+        );
+      } catch (err) {
+        if (err instanceof ListEntryError) {
+          throw err.index === null
+            ? bad('bad_request', plain(err.message), 'extraUrls')
+            : bad('invalid_url', plain(err.message), entries[err.index]?.field ?? 'extraUrls');
+        }
+        throw err;
+      }
+      if (!sameList(extra, current)) {
+        patch.extraUrls = extra;
+        changed.push('extraUrls');
+        parts.push(plural(extra.length, 'extra page'));
+      }
+    }
+    if (body.scopePath !== undefined) {
+      const raw = body.scopePath;
+      let scope: string | null = null;
+      if (raw !== null) {
+        if (typeof raw !== 'string') throw bad('bad_request', 'scopePath must be a path prefix like /docs, or null for the whole site.', 'scopePath');
+        try {
+          scope = parseScope(raw) ?? null;
+        } catch (err) {
+          throw userError(err, 'bad_request', 'scopePath');
+        }
+      }
+      if (scope !== (w.scopePath ?? null)) {
+        patch.scopePath = scope;
+        changed.push('scopePath');
+        parts.push(`scope ${scope ?? 'whole site'}`);
+      }
+    }
+    if (body.maxPages !== undefined) {
+      const v = body.maxPages;
+      if (typeof v !== 'number' || !Number.isInteger(v) || v < 1 || v > MAX_PAGES_LIMIT) {
+        throw bad('bad_request', `maxPages must be a whole number between 1 and ${MAX_PAGES_LIMIT}.`, 'maxPages');
+      }
+      if (v !== w.maxPages) {
+        patch.maxPages = v;
+        changed.push('maxPages');
+        parts.push(`max ${v} pages`);
+      }
+    }
+    return plan;
+  };
 
   // --- endpoints ---------------------------------------------------------------------------------------------------
 
@@ -541,6 +1258,7 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
       channelId: token.channelId,
       label: token.label,
       watches: store.listWatches(token.guildId).length,
+      limits: limits(),
     });
   };
 
@@ -587,18 +1305,19 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
   };
 
   const listWatches = ({ res, token, query }: Ctx) => {
-    let list = store.listWatches(token.guildId);
+    const all = store.listWatches(token.guildId);
     const rawUrl = query.get('url');
-    if (rawUrl === null) {
-      sendJson(res, 200, { watches: list.map((w) => toApiWatch(store, w)) });
-      return;
+    let list = all;
+    if (rawUrl !== null) {
+      const parsed = parseWatchInput(rawUrl);
+      if (!parsed) throw new ApiError(400, 'invalid_url', "That doesn't look like a website URL.");
+      const key = stripScheme(parsed.url);
+      const host = bareHost(parsed.host);
+      list = all.filter((w) => stripScheme(w.url) === key || bareHost(w.host) === host);
     }
-    const parsed = parseWatchInput(rawUrl);
-    if (!parsed) throw new ApiError(400, 'invalid_url', "That doesn't look like a website URL.");
-    const key = stripScheme(parsed.url);
-    const host = bareHost(parsed.host);
-    list = list.filter((w) => stripScheme(w.url) === key || bareHost(w.host) === host);
-    sendJson(res, 200, { watches: list.map((w) => toApiWatch(store, w)), watched: list.length > 0 });
+    const summary = summaryOf(all, guildOf(token.guildId));
+    const watches = list.map((w) => toApiWatch(store, w));
+    sendJson(res, 200, rawUrl === null ? { watches, summary } : { watches, watched: list.length > 0, summary });
   };
 
   const addWatch = async ({ res, token, body }: Ctx) => {
@@ -621,11 +1340,11 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
     }
     let intervalSec = defaultInterval(config);
     if (body.intervalSec !== undefined && body.intervalSec !== null) {
-      const v = body.intervalSec;
-      if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) {
+      const v = seconds(body.intervalSec, minInterval(config), MAX_INTERVAL_SEC);
+      if (v === null) {
         throw new ApiError(400, 'invalid_interval', `\`intervalSec\` must be a number of seconds (${minInterval(config)}–${MAX_INTERVAL_SEC}).`);
       }
-      intervalSec = Math.min(MAX_INTERVAL_SEC, Math.max(minInterval(config), Math.round(v)));
+      intervalSec = v;
     }
     const features: Partial<WatchFeatures> = {};
     if (body.features !== undefined && body.features !== null) {
@@ -636,6 +1355,17 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
         if (typeof v !== 'boolean') throw new ApiError(400, 'bad_request', `\`features.${k}\` must be true or false.`);
         features[k] = v;
       }
+    }
+    // Alert channel and ping role: from the token's server only (default: the token's channel, no ping).
+    let channelId = token.channelId;
+    if (body.channelId !== undefined && body.channelId !== null && body.channelId !== token.channelId) {
+      channelId = alertChannel(token.guildId, body.channelId, 'channelId').id;
+    }
+    let pingRoleId: string | null = null;
+    if (body.pingRoleId !== undefined && body.pingRoleId !== null) {
+      if (typeof body.pingRoleId !== 'string') throw bad('bad_request', 'pingRoleId must be a role id, or null for no ping.', 'pingRoleId');
+      pingRole(token.guildId, body.pingRoleId, 'pingRoleId');
+      pingRoleId = body.pingRoleId;
     }
 
     // Already watched (scheme-less: the http:// and https:// versions of one URL are the same site) → 200.
@@ -669,11 +1399,12 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
     try {
       watch = prepareAdd(cdeps, {
         guildId: token.guildId,
-        channelId: token.channelId,
+        channelId,
         userId: `link:${token.label}`,
         url: parsed.url,
         name,
         intervalSec,
+        pingRoleId,
         subdomains: features.subdomains ?? null,
       }).watch;
     } catch (err) {
@@ -716,7 +1447,13 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
   const getWatch = ({ res, token, route }: Ctx) => {
     const w = ownWatch(route, token);
     const events = store.listEvents(w.id, WATCH_EVENTS).map((e) => toApiEvent(e, w));
-    sendJson(res, 200, { watch: toApiWatch(store, w), events });
+    sendJson(res, 200, { watch: toApiWatch(store, w), card: cardOf(w, guildOf(w.guildId)), events, limits: limits() });
+  };
+
+  const patchWatch = ({ res, token, route, body }: Ctx) => {
+    const w = ownWatch(route, token);
+    const monitor = requireMonitor();
+    sendJson(res, 200, applySettings(w, planSettings(w, body), token, monitor, 'update'));
   };
 
   const deleteWatch = ({ res, token, route }: Ctx) => {
@@ -732,10 +1469,15 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
     void announce(w.channelId, `➖ **${nameOf(w)}** was removed from **${escapeMarkdown(token.label)}**`);
   };
 
-  const check = async ({ res, token, route }: Ctx) => {
+  const check = async ({ res, token, route, body }: Ctx) => {
     const w = ownWatch(route, token);
     const monitor = requireMonitor();
-    audit(token, 'check', { watchId: w.id, url: w.url });
+    let full = false;
+    if (body.full !== undefined && body.full !== null) {
+      if (typeof body.full !== 'boolean') throw bad('bad_request', 'full must be true or false.', 'full');
+      full = body.full;
+    }
+    audit(token, 'check', { watchId: w.id, url: w.url, full });
     let run = checks.get(w.id);
     if (!run) {
       const since = (now() - (lastCheckStart.get(w.id) ?? 0)) / 1000;
@@ -747,7 +1489,7 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
       if (lastCheckStart.size > 10_000) lastCheckStart.clear();
       let started: Promise<TickSummary>;
       try {
-        started = monitor.checkNow(w.id, { full: false });
+        started = monitor.checkNow(w.id, { full });
       } catch (err) {
         started = Promise.reject(err);
       }
@@ -770,6 +1512,144 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
     sendJson(res, 200, { alerts: r.alerts.length, kinds: [...new Set(r.alerts.map((a) => a.kind))], error: r.error ?? null });
   };
 
+  /** POST /watches/:id/pause | resume: an explicit desired state, so a stale UI can't flip it the wrong way. */
+  const setPaused = (paused: boolean) => ({ res, token, route, body }: Ctx) => {
+    const w = ownWatch(route, token);
+    const monitor = requireMonitor();
+    strictKeys(body, []);
+    if (w.paused === paused) {
+      sendJson(res, 200, manageResult(w, [], `${w.name} is already ${paused ? 'paused' : 'running'}.`, []));
+      return;
+    }
+    const updated = commit(w, { paused }, monitor);
+    audit(token, paused ? 'pause' : 'resume', { watchId: w.id, changes: ['paused'] });
+    announceChanges(w, updated, token);
+    const message = paused ? `Paused ${w.name} — no checks until you resume it.` : `Resumed ${w.name}.`;
+    sendJson(res, 200, manageResult(updated, ['paused'], message, []));
+  };
+
+  const getRules = ({ res, token, route }: Ctx) => {
+    const w = ownWatch(route, token);
+    sendJson(res, 200, { rules: rulesOf(w), limits: limits() });
+  };
+
+  const patchRules = ({ res, token, route, body }: Ctx) => {
+    const w = ownWatch(route, token);
+    const monitor = requireMonitor();
+    const plan = planRules(w, body);
+    if (!plan.changed.length) {
+      sendJson(res, 200, { ...manageResult(w, [], 'Nothing changed.', []), rules: rulesOf(w) });
+      return;
+    }
+    // Ignore patterns change the compared text: clear the noise heuristics so pages are re-judged under the new rules.
+    if (plan.patch.ignorePatterns) store.resetPageNoise(w.id);
+    const updated = commit(w, plan.patch, monitor);
+    audit(token, 'rules', { watchId: w.id, changes: plan.changed });
+    const message = `Rules saved — ${plan.parts.join(' · ')}. Affected pages are re-baselined silently.`;
+    sendJson(res, 200, { ...manageResult(updated, plan.changed, message, plan.warnings), rules: rulesOf(updated) });
+  };
+
+  const listPages = ({ res, token, route, query }: Ctx) => {
+    const w = ownWatch(route, token);
+    const list = query.get('list') ?? 'tracked';
+    if (!Object.hasOwn(PAGE_LISTS, list)) throw new ApiError(400, 'bad_request', '`list` must be "tracked", "untracked" or "files".');
+    const filter = PAGE_LISTS[list as keyof typeof PAGE_LISTS];
+    const limit = limitParam(query, PAGES_DEFAULT_LIMIT, PAGES_MAX_LIMIT);
+    const offset = intParam(query, 'offset') ?? 0;
+    const stats = store.pageStats(w.id);
+    const total = list === 'tracked' ? stats.tracked : list === 'untracked' ? Math.max(0, stats.known - stats.tracked) : stats.files;
+    const pages = store.listPageSummaries(w.id, { ...filter, limit, offset }).map(toApiPage);
+    const end = offset + pages.length;
+    sendJson(res, 200, {
+      counts: { tracked: stats.tracked, maxPages: w.maxPages, known: stats.known, files: stats.files, gone: stats.gone, dynamic: stats.dynamic },
+      list,
+      total,
+      pages,
+      nextOffset: pages.length > 0 && end < total ? end : null,
+    });
+  };
+
+  const listSubdomains = ({ res, token, route, query }: Ctx) => {
+    const w = ownWatch(route, token);
+    const limit = limitParam(query, SUBDOMAINS_DEFAULT_LIMIT, SUBDOMAINS_MAX_LIMIT);
+    const offset = intParam(query, 'offset') ?? 0;
+    // renderSubdomains' order: live first, then by host.
+    const all = store.listSubdomains(w.id).sort((a, b) => Number(b.alive) - Number(a.alive) || a.host.localeCompare(b.host));
+    const slice = all.slice(offset, offset + limit);
+    const watched = rootWatches(store.listWatches(w.guildId));
+    const end = offset + slice.length;
+    sendJson(res, 200, {
+      enabled: Boolean(w.features.subdomains),
+      rootDomain: w.rootDomain,
+      known: all.length,
+      live: all.filter((s) => s.alive).length,
+      total: all.length,
+      subdomains: slice.map((s) => {
+        const owner = watched.get(s.host.toLowerCase());
+        return toApiSubdomain(s, owner ? { id: owner.id, name: owner.name } : null);
+      }),
+      nextOffset: slice.length > 0 && end < all.length ? end : null,
+    });
+  };
+
+  const patchSubdomains = ({ res, token, route, body }: Ctx) => {
+    const w = ownWatch(route, token);
+    const monitor = requireMonitor();
+    strictKeys(body, ['enabled']);
+    if (body.enabled !== undefined && typeof body.enabled !== 'boolean') throw bad('bad_request', 'enabled must be true or false.', 'enabled');
+    const plan = planSettings(w, body.enabled === undefined ? {} : { checks: { subdomains: body.enabled } });
+    sendJson(res, 200, applySettings(w, plan, token, monitor, 'subdomains'));
+  };
+
+  /** "Watch this subdomain" (the watchsub: alert button) as its own site. */
+  const watchSubdomain = ({ res, token, route, body }: Ctx) => {
+    const parent = ownWatch(route, token);
+    const monitor = requireMonitor();
+    strictKeys(body, ['host']);
+    const target = typeof body.host === 'string' ? subdomainTarget(parent, body.host) : null;
+    if (!target) throw bad('invalid_url', `That isn't a host name under ${parent.rootDomain}.`, 'host');
+    refusePrivate(target.host, 'host');
+    const cdeps: CommandDeps = { store, config, log, monitor };
+    let added: { created: boolean; watch: Watch };
+    try {
+      added = addSubdomainWatch(cdeps, parent, target, `link:${token.label}`);
+    } catch (err) {
+      if (err instanceof WatchLimitError) throw new ApiError(409, 'limit_reached', plain(err.message));
+      throw err;
+    }
+    if (!added.created) {
+      sendJson(res, 200, { created: false, watch: toApiWatch(store, added.watch) });
+      return;
+    }
+    const watch = added.watch;
+    audit(token, 'add', { watchId: watch.id, url: watch.url, parent: parent.id });
+    sendJson(res, 201, { created: true, watch: toApiWatch(store, watch) });
+    const announced = announce(
+      watch.channelId,
+      `➕ **${nameOf(watch)}** (<${watch.url}>) was added from **${escapeMarkdown(token.label)}** — first scan running…`,
+    );
+    void firstScan(cdeps, watch, announced);
+  };
+
+  const history = ({ res, token, route, query }: Ctx) => {
+    const w = ownWatch(route, token);
+    const limit = limitParam(query, HISTORY_DEFAULT_LIMIT, HISTORY_MAX_LIMIT);
+    const before = intParam(query, 'before');
+    const events = store.listEvents(w.id, limit, before).map((e) => toApiEvent(e, w));
+    sendJson(res, 200, { events, nextBefore: events.length === limit ? events[events.length - 1].id : null });
+  };
+
+  const guild = ({ res, token }: Ctx) => {
+    const g = requireGuild(token.guildId);
+    const info: ApiGuildInfo = {
+      guild: { id: g.guild.id, name: g.guild.name },
+      tokenChannelId: token.channelId,
+      channels: g.channels.map((c) => ({ id: c.id, name: c.name, type: c.type, category: c.category ?? null, canPost: c.canPost, missing: [...c.missing] })),
+      roles: g.roles.map((r) => ({ id: r.id, name: r.name, everyone: r.everyone, managed: r.managed, color: r.color })),
+    };
+    sendJson(res, 200, info);
+  };
+
   const events = ({ res, token, query }: Ctx) => {
     const since = intParam(query, 'since') ?? 0;
     const limitRaw = intParam(query, 'limit');
@@ -787,6 +1667,9 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
     sendJson(res, 200, { events: list, nextSince: list.length ? list[list.length - 1].id : since });
   };
 
+  const pause = setPaused(true);
+  const resume = setPaused(false);
+
   const dispatch = async (ctx: Ctx): Promise<void> => {
     const { route, method } = ctx;
     switch (route.name) {
@@ -797,9 +1680,25 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
       case 'watches':
         return method === 'POST' ? addWatch(ctx) : listWatches(ctx);
       case 'watch':
-        return method === 'DELETE' ? deleteWatch(ctx) : getWatch(ctx);
+        return method === 'DELETE' ? deleteWatch(ctx) : method === 'PATCH' ? patchWatch(ctx) : getWatch(ctx);
       case 'check':
         return check(ctx);
+      case 'pause':
+        return pause(ctx);
+      case 'resume':
+        return resume(ctx);
+      case 'rules':
+        return method === 'PATCH' ? patchRules(ctx) : getRules(ctx);
+      case 'pages':
+        return listPages(ctx);
+      case 'subdomains':
+        return method === 'PATCH' ? patchSubdomains(ctx) : listSubdomains(ctx);
+      case 'watchSubdomain':
+        return watchSubdomain(ctx);
+      case 'history':
+        return history(ctx);
+      case 'guild':
+        return guild(ctx);
       case 'events':
         return events(ctx);
     }
@@ -820,7 +1719,7 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
     const route = matchRoute(sub);
     if (!route) throw new ApiError(404, 'not_found', `Unknown endpoint. See ${LINK_API_PREFIX}/ping.`);
     if (!route.methods.includes(method)) {
-      throw new ApiError(405, 'method_not_allowed', `Use ${route.methods.join(' or ')} for this endpoint.`, {
+      throw new ApiError(405, 'method_not_allowed', `Use ${methodList(route.methods)} for this endpoint.`, {
         allow: [...route.methods, 'OPTIONS'].join(', '),
       });
     }
@@ -849,10 +1748,7 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
     }
 
     const t = now();
-    const classes: LimitClass[] = ['all'];
-    if (route.name === 'scan') classes.push('scan');
-    if (route.name === 'watches' && method === 'POST') classes.push('add');
-    const retryAfter = limiter.take(token.id, classes, t);
+    const retryAfter = limiter.take(token.id, ['all', ...limitClasses(route, method)], t);
     if (retryAfter > 0) {
       throw new ApiError(429, 'rate_limited', `Too many requests — try again in ${retryAfter}s.`, { 'retry-after': String(retryAfter) });
     }
@@ -865,7 +1761,7 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
     }
 
     let body: Record<string, unknown> = {};
-    if (method === 'POST') {
+    if (method === 'POST' || method === 'PATCH') {
       const read = await readJsonBody(req);
       if (!read.ok) {
         if (read.error) throw read.error;
@@ -881,7 +1777,7 @@ export function createLinkApi(deps: LinkApiDeps): (req: http.IncomingMessage, re
 
   const fail = (res: http.ServerResponse, err: unknown) => {
     if (err instanceof ApiError) {
-      sendError(res, err.status, err.code, err.message, err.headers);
+      sendError(res, err.status, err.code, err.message, err.headers, err.field);
       return;
     }
     log.error('link: request failed', { err: err instanceof Error ? err : String(err) });
